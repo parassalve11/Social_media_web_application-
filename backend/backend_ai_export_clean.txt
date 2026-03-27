@@ -1,0 +1,4728 @@
+
+
+================ FILE: app.js ================
+
+import express from "express";
+import dotenv from "dotenv";
+import cookieParser from "cookie-parser";
+import cors from "cors";
+import path from "path";
+
+import authRouters from "./routers/auth.route.js";
+import postRoutes from "./routers/post.route.js";
+import notificationRoutes from "./routers/notification.route.js";
+import followRoutes from "./routers/follow.route.js";
+import userRoutes from "./routers/user.route.js";
+import MessageRoutes from "./routers/message.route.js";
+import StatusRoutes from "./routers/status.route.js";
+import ReelRoutes from "./routers/reel.route.js";          // ← NEW
+import { csrfProtect } from "./middlewares/csrf.middleware.js";
+
+dotenv.config();
+
+const __dirname = path.resolve();
+
+const createApp = ({ emailService, getIo } = {}) => {
+  const app = express();
+
+  app.use(cookieParser());
+  app.use(cors({ origin: process.env.CLIENT_URL, credentials: true }));
+  app.use(express.json({ limit: "5mb" }));
+
+  app.use((req, res, next) => {
+    if (getIo) {
+      const io = getIo();
+      if (io) {
+        req.io = io;
+        req.socketUserMap = io.socketUserMap;
+      }
+    }
+    next();
+  });
+
+  app.use(csrfProtect);
+
+  app.locals.emailService = emailService;
+
+  app.use("/api/v1/auth",          authRouters);
+  app.use("/api/v1/posts",         postRoutes);
+  app.use("/api/v1/notifications", notificationRoutes);
+  app.use("/api/v1/follows",       followRoutes);
+  app.use("/api/v1/users",         userRoutes);
+  app.use("/api/v1/message",       MessageRoutes);
+  app.use("/api/v1/status",        StatusRoutes);
+  app.use("/api/v1/reels",         ReelRoutes);             // ← NEW
+
+  if (process.env.NODE_ENV === "production") {
+    app.use(express.static(path.join(__dirname, "/frontend/dist")));
+    app.get("*", (req, res) => {
+      res.sendFile(path.join(__dirname, "frontend", "dist", "index.html"));
+    });
+  }
+
+  return app;
+};
+
+export default createApp;
+
+
+================ FILE: auth.integration.test.js ================
+
+import test, { before, after, beforeEach } from "node:test";
+import assert from "node:assert/strict";
+import mongoose from "mongoose";
+import { MongoMemoryServer } from "mongodb-memory-server";
+import request from "supertest";
+import createApp from "./app.js";
+import User from "./models/user.model.js";
+import { hashPassword } from "./lib/password.js";
+import { hashToken } from "./lib/tokens.js";
+
+process.env.JWT_SECRET = "test-secret";
+process.env.JWT_REFRESH_SECRET = "test-refresh-secret";
+process.env.ACCESS_TOKEN_MINUTES = "15";
+process.env.REFRESH_TOKEN_DAYS = "7";
+process.env.TOKEN_EXPIRES_MINUTES_VERIFY = "60";
+process.env.TOKEN_EXPIRES_MINUTES_PWD_RESET = "60";
+process.env.MAX_FAILED_LOGINS = "3";
+process.env.LOCKOUT_DURATION_MIN = "30";
+process.env.LOGIN_RATE_LIMIT_PER_IP = "100";
+process.env.RESET_RATE_LIMIT_PER_IP = "100";
+process.env.CLIENT_URL = "http://localhost:5173";
+
+let mongoServer;
+let app;
+let sentEmails = [];
+
+const emailService = {
+  sendVerificationEmail: async ({ user, token }) => {
+    sentEmails.push({ type: "verify", email: user.email, token });
+  },
+  sendPasswordResetEmail: async ({ user, token }) => {
+    sentEmails.push({ type: "reset", email: user.email, token });
+  },
+};
+
+before(async () => {
+  mongoServer = await MongoMemoryServer.create();
+  await mongoose.connect(mongoServer.getUri());
+  app = createApp({ emailService, getIo: () => null });
+});
+
+beforeEach(async () => {
+  sentEmails = [];
+  await User.deleteMany({});
+});
+
+after(async () => {
+  await mongoose.disconnect();
+  await mongoServer.stop();
+});
+
+test("signup -> verify -> login", async () => {
+  const payload = {
+    name: "Jane Doe",
+    username: "janedoe",
+    email: "jane@example.com",
+    password: "StrongPass1!",
+  };
+
+  await request(app).post("/api/v1/auth/signup").send(payload).expect(200);
+  assert.equal(sentEmails.length, 1);
+  const { token } = sentEmails[0];
+
+  const user = await User.findOne({ email: payload.email }).select(
+    "+verificationTokenHash +verificationTokenExpiresAt"
+  );
+  assert.ok(user);
+  assert.equal(user.verificationTokenHash, hashToken(token));
+  assert.notEqual(user.verificationTokenHash, token);
+
+  await request(app).post("/api/v1/auth/verify").send({ token }).expect(200);
+
+  const verified = await User.findOne({ email: payload.email });
+  assert.equal(verified.emailVerified, true);
+
+  await request(app)
+    .post("/api/v1/auth/signin")
+    .send({ identifier: payload.email, password: payload.password })
+    .expect(200);
+});
+
+test("forgot password -> reset -> login", async () => {
+  const password = "StrongPass1!";
+  const email = "reset@example.com";
+  const user = await User.create({
+    name: "Reset User",
+    username: "resetuser",
+    email,
+    password: await hashPassword(password),
+    emailVerified: true,
+  });
+
+  await request(app).post("/api/v1/auth/forgot").send({ email }).expect(200);
+
+  const resetEmail = sentEmails.find((item) => item.type === "reset");
+  assert.ok(resetEmail);
+
+  await request(app)
+    .post("/api/v1/auth/reset")
+    .send({ token: resetEmail.token, newPassword: "NewPass1!" })
+    .expect(200);
+
+  await request(app)
+    .post("/api/v1/auth/signin")
+    .send({ identifier: email, password: "NewPass1!" })
+    .expect(200);
+});
+
+test("locks account after repeated failed logins", async () => {
+  const email = "lock@example.com";
+  const password = "StrongPass1!";
+
+  await User.create({
+    name: "Locked User",
+    username: "lockeduser",
+    email,
+    password: await hashPassword(password),
+    emailVerified: true,
+  });
+
+  await request(app)
+    .post("/api/v1/auth/signin")
+    .send({ identifier: email, password: "WrongPass1!" })
+    .expect(401);
+
+  await request(app)
+    .post("/api/v1/auth/signin")
+    .send({ identifier: email, password: "WrongPass1!" })
+    .expect(401);
+
+  const locked = await request(app)
+    .post("/api/v1/auth/signin")
+    .send({ identifier: email, password: "WrongPass1!" })
+    .expect(423);
+
+  assert.ok(locked.body.lockedUntil);
+});
+
+
+
+================ FILE: controllers\auth.controller.js ================
+
+import User from "../models/user.model.js";
+import jwt from "jsonwebtoken";
+
+import { AUTH_CONFIG } from "../lib/auth.config.js";
+import { audit } from "../lib/audit.js";
+import { setAuthCookies, clearAuthCookies } from "../lib/authCookies.js";
+import { generateCsrfToken } from "../lib/csrf.js";
+import { logError, logInfo, logWarn } from "../lib/logger.js";
+import { comparePassword, hashPassword, validatePassword } from "../lib/password.js";
+import { rateLimit } from "../lib/rateLimit.js";
+import { createToken, hashToken } from "../lib/tokens.js";
+import { getClientIp, isValidEmail, isValidUsername, normalizeEmail } from "../lib/validators.js";
+
+const accessTokenExpiry = `${AUTH_CONFIG.accessTokenMinutes}m`;
+const refreshTokenExpiry = `${AUTH_CONFIG.refreshTokenDays}d`;
+
+const getRefreshSecret = () =>
+  process.env.JWT_REFRESH_SECRET || process.env.JWT_SECRET;
+
+const verifyCaptcha = async (token, ip) => {
+  if (!process.env.CAPTCHA_VERIFY_URL || !process.env.CAPTCHA_SECRET) {
+    return true;
+  }
+  if (!token) return false;
+
+  const response = await fetch(process.env.CAPTCHA_VERIFY_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({
+      secret: process.env.CAPTCHA_SECRET,
+      response: token,
+      remoteip: ip,
+    }),
+  });
+
+  if (!response.ok) return false;
+  const data = await response.json();
+  return Boolean(data.success);
+};
+
+const issueTokens = async (user, res) => {
+  const accessToken = jwt.sign(
+    { userId: user._id },
+    process.env.JWT_SECRET,
+    { expiresIn: accessTokenExpiry }
+  );
+
+  const refreshToken = jwt.sign(
+    { userId: user._id },
+    getRefreshSecret(),
+    { expiresIn: refreshTokenExpiry }
+  );
+
+  user.refreshTokenHash = hashToken(refreshToken);
+  user.refreshTokenExpiresAt = new Date(
+    Date.now() + AUTH_CONFIG.refreshTokenDays * 24 * 60 * 60 * 1000
+  );
+  await user.save();
+
+  const csrfToken = generateCsrfToken();
+  setAuthCookies({ res, accessToken, refreshToken, csrfToken });
+
+  return { accessToken, csrfToken };
+};
+
+const recordAudit = (req, action, userId, metadata = {}) =>
+  audit({
+    action,
+    userId,
+    ip: getClientIp(req),
+    userAgent: req.headers["user-agent"] || "",
+    metadata,
+  });
+
+export const signUp = async (req, res) => {
+  try {
+    const { name, username, email, password } = req.body;
+    const normalizedEmail = normalizeEmail(email);
+
+    if (!name || !username || !normalizedEmail || !password) {
+      return res.status(400).json({ message: "All fields are required" });
+    }
+
+    if (!isValidEmail(normalizedEmail)) {
+      return res.status(400).json({ message: "Invalid email address" });
+    }
+
+    if (!isValidUsername(username)) {
+      return res
+        .status(400)
+        .json({ message: "Username must be at least 3 characters" });
+    }
+
+    const passwordCheck = validatePassword(password);
+    if (!passwordCheck.ok) {
+      return res.status(400).json({
+        message: "Password is too weak",
+        hints: passwordCheck.hints,
+      });
+    }
+
+    const existingUsername = await User.findOne({ username });
+    if (existingUsername) {
+      return res.status(409).json({ message: "Username already in use" });
+    }
+
+    const existingEmail = await User.findOne({ email: normalizedEmail }).select(
+      "+verificationTokenHash +verificationTokenExpiresAt"
+    );
+
+    if (existingEmail) {
+      if (!existingEmail.emailVerified) {
+        const { token, tokenHash, expiresAt } = createToken(
+          "verify",
+          existingEmail._id,
+          AUTH_CONFIG.verifyTokenMinutes
+        );
+        existingEmail.verificationTokenHash = tokenHash;
+        existingEmail.verificationTokenExpiresAt = expiresAt;
+        await existingEmail.save();
+        await req.app.locals.emailService?.sendVerificationEmail({
+          user: existingEmail,
+          token,
+        });
+      }
+
+      await recordAudit(req, "signup_existing_email", existingEmail._id);
+      return res.status(200).json({
+        message: "If your email is eligible, you'll receive verification steps.",
+      });
+    }
+
+    const hashedPassword = await hashPassword(password);
+
+    const user = new User({
+      name,
+      username,
+      email: normalizedEmail,
+      password: hashedPassword,
+      authSource: "local",
+      emailVerified: false,
+    });
+
+    const { token, tokenHash, expiresAt } = createToken(
+      "verify",
+      user._id,
+      AUTH_CONFIG.verifyTokenMinutes
+    );
+    user.verificationTokenHash = tokenHash;
+    user.verificationTokenExpiresAt = expiresAt;
+
+    await user.save();
+
+    try {
+      await req.app.locals.emailService?.sendVerificationEmail({
+        user,
+        token,
+      });
+      logInfo("email.verification.sent", { userId: user._id.toString() });
+    } catch (error) {
+      logWarn("email.verification.failed", { error: error.message });
+    }
+
+    await recordAudit(req, "signup", user._id);
+
+    res.status(200).json({
+      message: "If your email is eligible, you'll receive verification steps.",
+    });
+  } catch (error) {
+    logError("auth.signup.error", { error: error.message });
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const signIn = async (req, res) => {
+  try {
+    const { email, username, identifier, password, captchaToken } = req.body;
+    const loginIdentifier = normalizeEmail(email || identifier || username || "");
+    const ip = getClientIp(req);
+
+    if (!loginIdentifier || !password) {
+      return res.status(400).json({ message: "Email and password required" });
+    }
+
+    const rateKey = `login:ip:${ip}`;
+    const ipLimit = await rateLimit({
+      key: rateKey,
+      limit: AUTH_CONFIG.loginRateLimitPerIp,
+      windowSeconds: AUTH_CONFIG.loginRateLimitWindowSec,
+    });
+
+    if (!ipLimit.allowed) {
+      return res
+        .status(429)
+        .json({ message: "Too many login attempts. Try again later." });
+    }
+
+    const user =
+      (await User.findOne({
+        email: loginIdentifier,
+      }).select("+password +refreshTokenHash +refreshTokenExpiresAt")) ||
+      (await User.findOne({ username: loginIdentifier }).select(
+        "+password +refreshTokenHash +refreshTokenExpiresAt"
+      ));
+
+    if (!user) {
+      await recordAudit(req, "login_failed", null, { reason: "not_found" });
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    if (user.lockoutUntil && user.lockoutUntil > new Date()) {
+      await recordAudit(req, "login_locked", user._id);
+      return res.status(423).json({
+        message: "Account locked. Try again later.",
+        lockedUntil: user.lockoutUntil,
+      });
+    }
+
+    if (user.authSource !== "local") {
+      await recordAudit(req, "login_failed", user._id, { reason: "wrong_source" });
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    const requireCaptcha =
+      user.failedLoginAttempts >= Math.floor(AUTH_CONFIG.maxFailedLogins / 2);
+    if (requireCaptcha) {
+      const captchaOk = await verifyCaptcha(captchaToken, ip);
+      if (!captchaOk) {
+        return res.status(400).json({
+          message: "Captcha verification required",
+          code: "CAPTCHA_REQUIRED",
+        });
+      }
+    }
+
+    const isPasswordCorrect = await comparePassword(password, user.password);
+    if (!isPasswordCorrect) {
+      user.failedLoginAttempts += 1;
+      if (user.failedLoginAttempts >= AUTH_CONFIG.maxFailedLogins) {
+        user.lockoutUntil = new Date(
+          Date.now() + AUTH_CONFIG.lockoutDurationMinutes * 60 * 1000
+        );
+      }
+      await user.save();
+
+      await recordAudit(req, "login_failed", user._id, { reason: "bad_password" });
+
+      return res.status(401).json({ message: "Invalid credentials" });
+    }
+
+    if (!user.emailVerified) {
+      await recordAudit(req, "login_failed", user._id, { reason: "unverified" });
+      return res.status(403).json({
+        message: "Email not verified",
+        code: "EMAIL_NOT_VERIFIED",
+        email: user.email,
+      });
+    }
+
+    user.failedLoginAttempts = 0;
+    user.lockoutUntil = null;
+    await user.save();
+
+    const { accessToken } = await issueTokens(user, res);
+
+    await recordAudit(req, "login_success", user._id);
+
+    res.status(200).json({
+      message: "Login successful",
+      token: accessToken,
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        username: user.username,
+        avatar: user.avatar,
+      },
+    });
+  } catch (error) {
+    logError("auth.signin.error", { error: error.message });
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const googleAuth = async (req, res) => {
+  try {
+    const { name, email, googleId } = req.body;
+    const normalizedEmail = normalizeEmail(email);
+
+    if (!name || !normalizedEmail || !googleId) {
+      return res.status(400).json({ message: "All fields are required" });
+    }
+
+    let user = await User.findOne({ email: normalizedEmail });
+    if (user) {
+      if (user.authSource !== "google") {
+        return res.status(401).json({
+          message: "User registered with a different auth method",
+        });
+      }
+      user.name = name;
+      user.googleId = googleId;
+      user.emailVerified = true;
+      user.emailVerifiedAt = new Date();
+    } else {
+      let username = normalizedEmail.split("@")[0];
+      let usernameExists = await User.findOne({ username });
+      let suffix = 1;
+      while (usernameExists) {
+        username = `${normalizedEmail.split("@")[0]}${suffix}`;
+        usernameExists = await User.findOne({ username });
+        suffix += 1;
+      }
+
+      user = new User({
+        name,
+        email: normalizedEmail,
+        googleId,
+        username,
+        authSource: "google",
+        emailVerified: true,
+        emailVerifiedAt: new Date(),
+      });
+    }
+
+    await user.save();
+    const { accessToken } = await issueTokens(user, res);
+
+    await recordAudit(req, "google_auth", user._id);
+
+    res.status(200).json({
+      message: "Google authentication successful",
+      token: accessToken,
+    });
+  } catch (error) {
+    logError("auth.google.error", { error: error.message });
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const signOut = async (req, res) => {
+  try {
+    const refreshToken = req.cookies?.refresh_token;
+    if (refreshToken) {
+      try {
+        const decoded = jwt.verify(refreshToken, getRefreshSecret());
+        const user = await User.findById(decoded.userId).select(
+          "+refreshTokenHash +refreshTokenExpiresAt"
+        );
+        if (user) {
+          user.refreshTokenHash = null;
+          user.refreshTokenExpiresAt = null;
+          await user.save();
+        }
+      } catch (error) {
+        logWarn("auth.signout.refresh_clear_failed", { error: error.message });
+      }
+    }
+
+    clearAuthCookies(res);
+    res.status(200).json({ message: "Signed out" });
+  } catch (error) {
+    logError("auth.signout.error", { error: error.message });
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const getCurrentUser = async (req, res) => {
+  try {
+    res.json(req.user);
+  } catch (error) {
+    logError("auth.me.error", { error: error.message });
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const verifyEmail = async (req, res) => {
+  try {
+    const { token } = req.body;
+    if (!token) {
+      return res.status(400).json({ message: "Token is required" });
+    }
+
+    const tokenHash = hashToken(token);
+    const user = await User.findOne({
+      verificationTokenHash: tokenHash,
+      verificationTokenExpiresAt: { $gt: new Date() },
+    });
+
+    if (!user) {
+      return res.status(400).json({
+        message: "Token invalid or expired",
+        code: "TOKEN_INVALID_OR_EXPIRED",
+      });
+    }
+
+    user.emailVerified = true;
+    user.emailVerifiedAt = new Date();
+    user.verificationTokenHash = null;
+    user.verificationTokenExpiresAt = null;
+    await user.save();
+
+    await recordAudit(req, "email_verified", user._id);
+
+    res.status(200).json({ message: "Email verified successfully" });
+  } catch (error) {
+    logError("auth.verify.error", { error: error.message });
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const resendVerification = async (req, res) => {
+  try {
+    const identifier = req.body?.email || req.body?.identifier || req.body?.username || "";
+    const normalizedEmail = normalizeEmail(identifier);
+    if (!normalizedEmail || !isValidEmail(normalizedEmail)) {
+      return res.status(200).json({
+        message: "If your email is eligible, you'll receive verification steps.",
+      });
+    }
+
+    const ip = getClientIp(req);
+    const rateKey = `verify:resend:${normalizedEmail}:${ip}`;
+    const limit = await rateLimit({
+      key: rateKey,
+      limit: 1,
+      windowSeconds: AUTH_CONFIG.resendVerifyWindowSec,
+    });
+    if (!limit.allowed) {
+      return res.status(429).json({
+        message: "Please wait before requesting another email.",
+        retryAfterSeconds: AUTH_CONFIG.resendVerifyWindowSec,
+      });
+    }
+
+    const user = await User.findOne({ email: normalizedEmail });
+    if (!user || user.emailVerified) {
+      return res.status(200).json({
+        message: "If your email is eligible, you'll receive verification steps.",
+      });
+    }
+
+    const { token, tokenHash, expiresAt } = createToken(
+      "verify",
+      user._id,
+      AUTH_CONFIG.verifyTokenMinutes
+    );
+    user.verificationTokenHash = tokenHash;
+    user.verificationTokenExpiresAt = expiresAt;
+    await user.save();
+
+    await req.app.locals.emailService?.sendVerificationEmail({ user, token });
+    await recordAudit(req, "verification_resent", user._id);
+
+    res.status(200).json({
+      message: "If your email is eligible, you'll receive verification steps.",
+    });
+  } catch (error) {
+    logError("auth.resend.error", { error: error.message });
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const forgotPassword = async (req, res) => {
+  try {
+    const normalizedEmail = normalizeEmail(req.body?.email || "");
+    if (!normalizedEmail || !isValidEmail(normalizedEmail)) {
+      return res.status(400).json({ message: "Invalid email address" });
+    }
+
+    const ip = getClientIp(req);
+    const rateKey = `reset:ip:${ip}`;
+    const limit = await rateLimit({
+      key: rateKey,
+      limit: AUTH_CONFIG.resetRateLimitPerIp,
+      windowSeconds: AUTH_CONFIG.resetRateLimitWindowSec,
+    });
+    if (!limit.allowed) {
+      return res.status(429).json({
+        message: "Too many reset requests. Try again later.",
+      });
+    }
+    const emailKey = `reset:email:${normalizedEmail}`;
+    const emailLimit = await rateLimit({
+      key: emailKey,
+      limit: 3,
+      windowSeconds: AUTH_CONFIG.resetRateLimitWindowSec,
+    });
+    if (!emailLimit.allowed) {
+      return res.status(429).json({
+        message: "Too many reset requests. Try again later.",
+      });
+    }
+
+    const user = await User.findOne({ email: normalizedEmail });
+    if (user) {
+      const { token, tokenHash, expiresAt } = createToken(
+        "reset",
+        user._id,
+        AUTH_CONFIG.resetTokenMinutes
+      );
+      user.passwordResetTokenHash = tokenHash;
+      user.passwordResetTokenExpiresAt = expiresAt;
+      await user.save();
+
+      try {
+        await req.app.locals.emailService?.sendPasswordResetEmail({
+          user,
+          token,
+        });
+        logInfo("email.reset.sent", { userId: user._id.toString() });
+      } catch (error) {
+        logWarn("email.reset.failed", { error: error.message });
+      }
+
+      await recordAudit(req, "password_reset_requested", user._id);
+    }
+
+    res.status(200).json({
+      message: "If your email is registered, you'll receive reset instructions.",
+    });
+  } catch (error) {
+    logError("auth.forgot.error", { error: error.message });
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const resetPassword = async (req, res) => {
+  try {
+    const { token, newPassword } = req.body;
+    if (!token || !newPassword) {
+      return res.status(400).json({ message: "Token and password required" });
+    }
+
+    const passwordCheck = validatePassword(newPassword);
+    if (!passwordCheck.ok) {
+      return res.status(400).json({
+        message: "Password is too weak",
+        hints: passwordCheck.hints,
+      });
+    }
+
+    const tokenHash = hashToken(token);
+    const user = await User.findOne({
+      passwordResetTokenHash: tokenHash,
+      passwordResetTokenExpiresAt: { $gt: new Date() },
+    }).select("+password");
+
+    if (!user) {
+      return res.status(400).json({
+        message: "Token invalid or expired",
+        code: "TOKEN_INVALID_OR_EXPIRED",
+      });
+    }
+
+    const isSamePassword = user.password
+      ? await comparePassword(newPassword, user.password)
+      : false;
+    if (isSamePassword) {
+      return res.status(400).json({ message: "Password must be new" });
+    }
+
+    user.password = await hashPassword(newPassword);
+    user.passwordChangedAt = new Date();
+    user.passwordResetTokenHash = null;
+    user.passwordResetTokenExpiresAt = null;
+    await user.save();
+
+    await recordAudit(req, "password_reset_completed", user._id);
+
+    res.status(200).json({ message: "Password updated successfully" });
+  } catch (error) {
+    logError("auth.reset.error", { error: error.message });
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const refreshToken = async (req, res) => {
+  try {
+    const token = req.cookies?.refresh_token;
+    if (!token) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const decoded = jwt.verify(token, getRefreshSecret());
+    const user = await User.findById(decoded.userId).select(
+      "+refreshTokenHash +refreshTokenExpiresAt"
+    );
+
+    if (
+      !user ||
+      !user.refreshTokenHash ||
+      user.refreshTokenHash !== hashToken(token) ||
+      (user.refreshTokenExpiresAt && user.refreshTokenExpiresAt < new Date())
+    ) {
+      return res.status(401).json({ message: "Unauthorized" });
+    }
+
+    const { accessToken } = await issueTokens(user, res);
+    res.status(200).json({ token: accessToken });
+  } catch (error) {
+    logError("auth.refresh.error", { error: error.message });
+    res.status(401).json({ message: "Unauthorized" });
+  }
+};
+
+
+
+================ FILE: controllers\follow.controller.js ================
+
+import Follow from "../models/follow.model.js";
+import Notification from "../models/notification.model.js";
+import User from "../models/user.model.js";
+
+/* ─── helper ─── */
+const emitNotification = (req, recipientId, notification) => {
+  if (!req.io || !req.socketUserMap) return;
+  const socketId = req.socketUserMap.get(String(recipientId));
+  if (socketId) req.io.to(socketId).emit("new_notification", notification);
+};
+
+export const followUser = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const followerId = req.user._id;
+
+    if (followerId.toString() === userId) {
+      return res.status(401).json({ message: "You cannot follow yourself" });
+    }
+
+    const follower = await User.findById(followerId);
+    const following = await User.findById(userId);
+
+    if (!follower || !following) {
+      return res.status(400).json({ message: "User not found" });
+    }
+
+    const existingFollow = await Follow.findOne({ follower: followerId, followed: userId });
+    if (existingFollow) {
+      return res.status(400).json({ message: "Already following this user" });
+    }
+
+    await new Follow({ follower: followerId, followed: userId }).save();
+    await User.findByIdAndUpdate(followerId, { $addToSet: { following: userId } });
+    await User.findByIdAndUpdate(userId, { $addToSet: { followers: followerId } });
+
+    // Create notification
+    const notification = new Notification({
+      recipient: userId,
+      type: "follow",
+      relatedUser: followerId,
+    });
+    await notification.save();
+
+    // ── Real-time emit ──
+    const populatedNotification = await Notification.findById(notification._id)
+      .populate("relatedUser", "name username avatar");
+
+    emitNotification(req, userId, populatedNotification);
+
+    res.status(200).json({
+      message: "Successfully followed user",
+      followerId: followerId.toString(),
+      followedId: userId.toString(),
+    });
+  } catch (error) {
+    console.log("Error in followUser Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const unfollowUser = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const followerId = req.user._id;
+
+    const followers = await User.findById(followerId);
+    const following = await User.findById(userId);
+
+    if (!followers || !following) {
+      return res.status(400).json({ message: "User not found" });
+    }
+
+    const existingFollow = await Follow.findOne({ follower: followerId, followed: userId });
+    if (!existingFollow) {
+      return res.status(401).json({ message: "You are not following this user" });
+    }
+
+    await Follow.deleteOne({ follower: followerId, followed: userId });
+    await User.findByIdAndUpdate(followerId, { $pull: { following: userId } });
+    await User.findByIdAndUpdate(userId, { $pull: { followers: followerId } });
+
+    await Notification.deleteOne({ recipient: userId, type: "follow", relatedUser: followerId });
+
+    res.status(200).json({
+      message: "Successfully unfollowed user",
+      followerId: followerId.toString(),
+      followedId: userId.toString(),
+    });
+  } catch (error) {
+    console.log("Error in unfollowUser Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const getfollowers = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    const user = await User.findById(userId).populate("followers", "name username avatar bio");
+    if (!user) return res.status(400).json({ message: "User not found" });
+    res.json(user.followers);
+  } catch (error) {
+    console.log("Error in getfollowers Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const getfollowing = async (req, res) => {
+  const { userId } = req.params;
+  const user = await User.findById(userId).populate("following", "name username avatar bio");
+  if (!user) return res.status(400).json({ message: "User not found" });
+  res.json(user?.following);
+  try {
+  } catch (error) {
+    console.log("Error in getfollowing Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+
+================ FILE: controllers\message.controller.js ================
+
+import { uploadToClouduinary } from "../lib/cloudinary.js";
+import Conversation from "../models/conversation.model.js";
+import Message from "../models/message.model.js";
+import response from "../lib/responeHandler.js";
+
+export const sendMessage = async (req, res) => {
+  try {
+    const { senderId, receiverId, content, messageStatus } = req.body;
+    const files = req.files; // 👈 MULTIPLE FILES
+    const participants = [senderId, receiverId].sort();
+
+    let conversation = await Conversation.findOne({ participants });
+    if (!conversation) {
+      conversation = await Conversation.create({ participants });
+    }
+
+    let imageOrVideoUrl = [];
+    let contentType = null;
+
+    /* ---------- MEDIA ---------- */
+    if (files && files.length > 0) {
+      for (const file of files) {
+        const upload = await uploadToClouduinary(file);
+        if (!upload?.secure_url) {
+          return response(res, 400, "File upload failed");
+        }
+
+        imageOrVideoUrl.push(upload.secure_url);
+
+        if (file.mimetype.startsWith("image/")) {
+          contentType = "image";
+        } else if (file.mimetype.startsWith("video/")) {
+          contentType = "video";
+        } else {
+          return response(res, 400, "Unsupported file type");
+        }
+      }
+    }
+    /* ---------- TEXT ---------- */
+    else if (content?.trim()) {
+      contentType = "text";
+    } else {
+      return response(res, 400, "Message content is required");
+    }
+
+    const message = await Message.create({
+      conversation: conversation._id,
+      sender: senderId,
+      receiver: receiverId,
+      content,
+      imageOrVideoUrl,
+      contentType,
+      messageStatus,
+    });
+
+    conversation.lastMessage = message._id;
+    conversation.unreadCount += 1;
+    await conversation.save();
+
+    const populatedMessage = await Message.findById(message._id)
+      .populate("sender", "username profilePicture")
+      .populate("receiver", "username profilePicture");
+
+    /* ---------- SOCKET ---------- */
+    if (req.io && req.socketUserMap) {
+      const senderSocketId = req.socketUserMap.get(senderId);
+      const receiverSocketId = req.socketUserMap.get(receiverId);
+
+      if (senderSocketId)
+        req.io.to(senderSocketId).emit("send_message", populatedMessage);
+
+      if (receiverSocketId)
+        req.io.to(receiverSocketId).emit("receive_message", populatedMessage);
+    }
+
+    return response(res, 201, "Message sent", populatedMessage);
+  } catch (error) {
+    console.error(error);
+    return response(res, 500, "Internal server error");
+  }
+};
+
+
+export const getConversation = async (req, res) => {
+  try {
+    const userId = req.user._id;
+
+    const conversation = await Conversation.find({
+      participants: userId,
+    })
+      .populate("participants", "username profilePicture lastSeen isOnline ")
+      .populate({
+        path: "lastMessage",
+        populate: {
+          path: "sender receiver",
+          select: "username profilePicture",
+        },
+      })
+      .sort({ updatedAt: -1 });
+
+    return response(res, 201, "conversation get successfully", conversation);
+  } catch (error) {
+    console.log("Error on getConversation controller", error.message);
+    return response(res, 500, "Internal server Error");
+  }
+};
+
+export const getMessages = async (req, res) => {
+  try {
+    const { conversationId } = req.params;
+    const userId = req.user._id;
+
+    const conversation = await Conversation.findById(conversationId);
+
+    if (!conversation) {
+      return response(res, 404, "Conversation not Found");
+    }
+
+    const isParticipant = conversation.participants.some(
+      (participantId) =>
+        participantId.toString() === userId.toString()
+    );
+    if (!isParticipant) {
+      return response(
+        res,
+        403,
+        "Your not authorized to access this conversation"
+      );
+    }
+
+    const messages = await Message.find({
+      conversation: conversationId,
+    })
+      .populate("sender", "username profilePicture lastSeen isOnline")
+      .populate("receiver", "username profilePicture lastSeen isOnline")
+      .sort({ createdAt: 1 });
+
+    await Message.updateMany(
+      {
+        conversation: conversationId,
+        receiver: userId,
+        messageStatus: { $in: ["send", "delivered"] },
+      },
+      {
+        $set: { messageStatus: "read" },
+      }
+    );
+
+    conversation.unreadCount = 0;
+    await conversation.save();
+
+    return response(res, 201, "Mesages retrived", messages);
+  } catch (error) {
+    console.log("Error on getMessages controller", error.message);
+    return response(res, 500, "Internal server Error");
+  }
+};
+
+export const markAsRead = async (req, res) => {
+  try {
+    const { messageIds } = req.body;
+    const userId = req.user._id;
+
+    const messages = await Message.find({
+      _id: { $in: messageIds },
+      receiver: userId,
+    });
+
+    await Message.updateMany(
+      {
+        _id: { $in: messageIds },
+        receiver: userId,
+      },
+      { $set: { messageStatus: "read" } }
+    );
+
+    //emit socket
+    if (req.io && req.socketUserMap) {
+      for (const message of messages) {
+        const senderSocketId = req.socketUserMap.get(
+          message.sender._id.toString()
+        );
+        if (senderSocketId) {
+          const updatedMessage = {
+            _id: message._id,
+            messageStatus: "read",
+          };
+
+          req.io.to(senderSocketId).emit("message_read", updatedMessage);
+
+          await message.save();
+        }
+      }
+    }
+
+    return response(res, 201, "mark as readed", messages);
+  } catch (error) {
+    console.log("Error on markAsRead controller", error.message);
+    return response(res, 500, "Internal server Error");
+  }
+};
+
+export const deleteMessage = async (req, res) => {
+  try {
+    const { messageId } = req.params;
+    const userId = req.user._id;
+
+    const message = await Message.findById(messageId);
+
+    if (!message) {
+      return response(res, 404, "Message not Found");
+    }
+
+    if (message.sender.toString() !== userId.toString()) {
+      return response(res, 403, "Not authorized to delete this message");
+    }
+
+    await message.deleteOne();
+
+    //emit sockets
+
+    if (req.io && req.socketUserMap) {
+      const receiverSocketId = req.socketUserMap.get(
+        message.receiver._id.toString()
+      );
+      if (receiverSocketId) {
+        req.io.to(receiverSocketId).emit("message_deleted", messageId);
+      }
+    }
+
+    return response(res, 201, "Message deleted successfully");
+  } catch (error) {
+    console.log("Error on deleteMessage controller", error.message);
+    return response(res, 500, "Internal server Error");
+  }
+};
+
+
+
+================ FILE: controllers\notification.controller.js ================
+
+import Notification from "../models/notification.model.js";
+
+export const getNotifications = async (req, res) => {
+  try {
+    const userId = req.user._id;
+
+    const notifications = await Notification.find({ recipient: userId })
+      .populate("relatedUser", "name username avatar")
+      .populate("relatedPost", "content image")
+      .sort({ createdAt: -1 });
+
+    res.json(notifications);
+  } catch (error) {
+    console.log("Error in getNotifications Controller", error.message);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const markNotificationAsRead = async (req, res) => {
+  try {
+    const notificationId = req.params.id;
+    const userId = req.user._id;
+
+    const notification = await Notification.findOneAndUpdate(
+      { _id: notificationId, recipient: userId },
+      { read: true },
+      { new: true }
+    );
+
+    res.json(notification);
+  } catch (error) {
+    console.log("Error in markNotificationAsRead Controller", error.message);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+/* ── NEW: mark ALL unread notifications as read at once ── */
+export const markAllNotificationsAsRead = async (req, res) => {
+  try {
+    const userId = req.user._id;
+
+    await Notification.updateMany(
+      { recipient: userId, read: false },
+      { $set: { read: true } }
+    );
+
+    res.status(200).json({ message: "All notifications marked as read" });
+  } catch (error) {
+    console.log("Error in markAllNotificationsAsRead Controller", error.message);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const deleteNotification = async (req, res) => {
+  try {
+    const notificationId = req.params.id;
+    const userId = req.user._id;
+
+    await Notification.findOneAndDelete({
+      _id: notificationId,
+      recipient: userId,
+    });
+
+    res.json({ message: "Notification deleted successfully" });
+  } catch (error) {
+    console.log("Error in deleteNotification Controller", error.message);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const getUnreadNotificationsCount = async (req, res) => {
+  try {
+    const userId = req.user._id;
+
+    const unreadCount = await Notification.countDocuments({
+      recipient: userId,
+      read: false,
+    });
+
+    res.status(200).json({ count: unreadCount });
+  } catch (error) {
+    console.error("Error fetching unread notifications count:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+
+================ FILE: controllers\post.controller.js ================
+
+import mongoose from "mongoose";
+import cloudinary, { uploadToClouduinary } from "../lib/cloudinary.js";
+import Notification from "../models/notification.model.js";
+import Post from "../models/post.model.js";
+import User from "../models/user.model.js";
+
+/* ─── helper: emit new_notification to a user's socket if online ─── */
+const emitNotification = (req, recipientId, notification) => {
+  if (!req.io || !req.socketUserMap) return;
+  const socketId = req.socketUserMap.get(String(recipientId));
+  if (socketId) {
+    req.io.to(socketId).emit("new_notification", notification);
+  }
+};
+
+const getPublicIdFromUrl = (url = "") => {
+  if (!url) return null;
+  const parts = url.split("/upload/");
+  if (parts.length < 2) {
+    const last = url.split("/").pop() || "";
+    return last.split(".")[0] || null;
+  }
+  const path = parts[1].replace(/^v\d+\//, "");
+  return path.replace(/\.[^/.]+$/, "");
+};
+
+const inferResourceType = (url = "") => {
+  const lower = url.toLowerCase();
+  if (
+    lower.includes("/video/") ||
+    lower.includes(".mp4") ||
+    lower.includes(".webm") ||
+    lower.includes(".mov") ||
+    lower.includes(".m4v")
+  ) {
+    return "video";
+  }
+  return "image";
+};
+
+const destroyMediaItem = async (item) => {
+  const url = item?.url || item;
+  const publicId = item?.publicId || getPublicIdFromUrl(url);
+  if (!publicId) return;
+  const resourceType = item?.type || inferResourceType(url);
+  const options = resourceType === "video" ? { resource_type: "video" } : undefined;
+  await cloudinary.uploader.destroy(publicId, options);
+};
+
+export const getPostFeeds = async (req, res) => {
+  try {
+    const cursor = req.query.cursor || null;
+    const pageSize = 7;
+
+    const query = {};
+    let postsQuery = Post.find(query)
+      .sort({ createdAt: -1 })
+      .populate("author", "name username avatar bio followers following")
+      .populate("comments.user", "name username avatar bio followers following")
+      .limit(pageSize + 1);
+
+    if (cursor) {
+      postsQuery = postsQuery.where("_id").lt(cursor);
+    }
+
+    const posts = await postsQuery.exec();
+    const hasMore = posts.length > pageSize;
+    const nextCursor = hasMore ? posts[pageSize - 1]._id : null;
+
+    res.status(200).json({
+      posts: posts.slice(0, pageSize),
+      nextCursor,
+      hasMore,
+    });
+  } catch (error) {
+    console.log("Error in getPostFeeds Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const getFollowingPostFeed = async (req, res) => {
+  try {
+    const cursor = req.query.cursor || null;
+    const pageSize = 7;
+    const following = req.user.following;
+
+    if (!following || following.length === 0) {
+      return res.status(200).json({ posts: [], nextCursor: null, hasMore: false });
+    }
+
+    let postsQuery = Post.find({ author: { $in: [...following] } })
+      .sort({ createdAt: -1 })
+      .populate("author", "name username avatar bio followers following")
+      .populate("comments.user", "name username avatar bio followers following")
+      .limit(pageSize + 1);
+
+    if (cursor) {
+      if (!mongoose.isValidObjectId(cursor)) {
+        return res.status(400).json({ message: "Invalid cursor" });
+      }
+      postsQuery = postsQuery.where("_id").lt(cursor);
+    }
+
+    const posts = await postsQuery.exec();
+    const hasMore = posts.length > pageSize;
+    const nextCursor = hasMore ? posts[pageSize - 1]._id : null;
+
+    res.status(200).json({
+      posts: posts.slice(0, pageSize),
+      nextCursor,
+      hasMore,
+    });
+  } catch (error) {
+    console.error("Error in getFollowingPostFeed Controller", error.stack);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const getPostsByUsername = async (req, res) => {
+  try {
+    const normalizedUsername = String(req.params.username || "").toLowerCase();
+    if (!normalizedUsername) {
+      return res.status(400).json({ message: "Username is required" });
+    }
+
+    const user = await User.findOne({ username: normalizedUsername }).select("_id");
+    if (!user) {
+      return res.status(404).json({ message: "User not Found" });
+    }
+
+    const posts = await Post.find({ author: user._id })
+      .sort({ createdAt: -1 })
+      .populate("author", "name username avatar bio followers following")
+      .populate("comments.user", "name username avatar bio followers following");
+
+    return res.status(200).json(posts);
+  } catch (error) {
+    console.error("Error in getPostsByUsername Controller", error.stack);
+    return res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const createPost = async (req, res) => {
+  try {
+    const content = typeof req.body.content === "string" ? req.body.content : "";
+    const legacyImage = req.body.image;
+    const files = Array.isArray(req.files) ? req.files : [];
+    const hasMediaFiles = files.length > 0;
+    let media = [];
+    let coverImage = null;
+
+    if (!content.trim() && !legacyImage && !hasMediaFiles) {
+      return res.status(400).json({ message: "Content or media is required" });
+    }
+
+    if (hasMediaFiles) {
+      const uploads = await Promise.all(files.map((file) => uploadToClouduinary(file)));
+      media = uploads
+        .filter(Boolean)
+        .map((upload) => ({
+          url: upload.secure_url,
+          type: upload.resource_type === "video" ? "video" : "image",
+          publicId: upload.public_id,
+        }));
+      coverImage = media.find((item) => item.type === "image")?.url || null;
+    } else if (legacyImage) {
+      const imgResult = await cloudinary.uploader.upload(legacyImage);
+      if (!imgResult) {
+        return res.status(401).json({ message: "The image is not get uploaded" });
+      }
+      media = [{ url: imgResult.secure_url, type: "image", publicId: imgResult.public_id }];
+      coverImage = imgResult.secure_url;
+    }
+
+    const newPost = new Post({
+      author: req.user._id,
+      content,
+      media,
+      image: coverImage || undefined,
+    });
+
+    await newPost.save();
+    await User.findByIdAndUpdate(req.user._id, { $inc: { postsCount: 1 } });
+
+    res.status(200).json({ message: "Post Created successfully." });
+  } catch (error) {
+    console.log("Error in CreatePost Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const deletePost = async (req, res) => {
+  try {
+    const postId = req.params.id;
+    const userId = req.user._id;
+
+    const posts = await Post.findById(postId);
+    if (!posts) return res.status(403).json({ message: "Post not Found." });
+
+    if (posts.author.toString() !== userId.toString()) {
+      return res.status(401).json({ message: "You are not authorized to delete this Post" });
+    }
+
+    if (Array.isArray(posts.media) && posts.media.length > 0) {
+      await Promise.all(posts.media.map((item) => destroyMediaItem(item)));
+    } else if (posts.image) {
+      await destroyMediaItem({ url: posts.image, type: inferResourceType(posts.image) });
+    }
+    await Post.findByIdAndDelete(postId);
+    await User.findByIdAndUpdate(userId, { $inc: { postsCount: -1 } });
+    await User.updateOne({ _id: userId, postsCount: { $lt: 0 } }, { $set: { postsCount: 0 } });
+
+    res.status(201).json({ message: "Post deleted successfully." });
+  } catch (error) {
+    console.log("Error in deletePost Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const updatePost = async (req, res) => {
+  try {
+    const postId = req.params.id;
+    const post = await Post.findById(postId);
+    if (!post) return res.status(400).json({ message: "Post not Found" });
+
+    const updatedData = {};
+    const content = typeof req.body.content === "string" ? req.body.content : undefined;
+    const legacyImage = req.body.image;
+    const files = Array.isArray(req.files) ? req.files : [];
+    const hasMediaFiles = files.length > 0;
+    const clearMedia = String(req.body.clearMedia || "").toLowerCase() === "true";
+
+    if (typeof content === "string") {
+      updatedData.content = content;
+    }
+
+    const deleteExistingMedia = async () => {
+      if (Array.isArray(post.media) && post.media.length > 0) {
+        await Promise.all(post.media.map((item) => destroyMediaItem(item)));
+      } else if (post.image) {
+        await destroyMediaItem({ url: post.image, type: inferResourceType(post.image) });
+      }
+    };
+
+    if (hasMediaFiles) {
+      const uploads = await Promise.all(files.map((file) => uploadToClouduinary(file)));
+      const media = uploads
+        .filter(Boolean)
+        .map((upload) => ({
+          url: upload.secure_url,
+          type: upload.resource_type === "video" ? "video" : "image",
+          publicId: upload.public_id,
+        }));
+      const coverImage = media.find((item) => item.type === "image")?.url || null;
+
+      await deleteExistingMedia();
+      updatedData.media = media;
+      updatedData.image = coverImage || null;
+    } else if (legacyImage) {
+      const result = await cloudinary.uploader.upload(legacyImage);
+      await deleteExistingMedia();
+      updatedData.media = [{ url: result.secure_url, type: "image", publicId: result.public_id }];
+      updatedData.image = result.secure_url;
+    } else if (clearMedia) {
+      await deleteExistingMedia();
+      updatedData.media = [];
+      updatedData.image = null;
+    }
+
+    await Post.findByIdAndUpdate(postId, { $set: updatedData }, { new: true }).select("-password");
+    res.status(201).json("Post Edited successfully");
+  } catch (error) {
+    console.log("Error in updatePost Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const getPostById = async (req, res) => {
+  try {
+    const postId = req.params.id;
+    const posts = await Post.findById({ _id: postId })
+      .populate("author", "name username avatar bio followers following")
+      .populate("comments.user", "name username avatar bio followers following");
+
+    if (!posts) return res.status(400).json({ message: "Post not Found" });
+    res.json(posts);
+  } catch (error) {
+    console.log("Error in getPostById Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const createComment = async (req, res) => {
+  try {
+    const postId = req.params.id;
+    const userId = req.user._id;
+    const { content } = req.body;
+
+    const post = await Post.findByIdAndUpdate(
+      postId,
+      { $push: { comments: { user: userId, content } } },
+      { new: true }
+    ).populate("author", "name username avatar");
+
+    // Create & emit notification (skip if commenting on own post)
+    if (post.author._id.toString() !== userId.toString()) {
+      const notification = new Notification({
+        recipient: post.author._id,
+        type: "comment",
+        relatedUser: userId,
+        relatedPost: postId,
+      });
+      await notification.save();
+
+      // ── Real-time emit ──
+      const populatedNotification = await Notification.findById(notification._id)
+        .populate("relatedUser", "name username avatar")
+        .populate("relatedPost", "content image");
+
+      emitNotification(req, post.author._id, populatedNotification);
+    }
+
+    res.status(200).json(post);
+  } catch (error) {
+    console.log("Error in createComment Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const likePost = async (req, res) => {
+  try {
+    const postId = req.params.id;
+    const userId = req.user._id;
+
+    const post = await Post.findById(postId);
+
+    const alreadyLiked = post.likes.includes(userId);
+    if (alreadyLiked) {
+      post.likes = post.likes.filter((id) => id.toString() !== userId.toString());
+    } else {
+      post.likes.push(userId);
+    }
+
+    // Create & emit notification on NEW like (skip on unlike, skip own post)
+    if (!alreadyLiked && post.author.toString() !== userId.toString()) {
+      const notification = new Notification({
+        recipient: post.author,
+        type: "like",
+        relatedUser: userId,
+        relatedPost: postId,
+      });
+      await notification.save();
+
+      // ── Real-time emit ──
+      const populatedNotification = await Notification.findById(notification._id)
+        .populate("relatedUser", "name username avatar")
+        .populate("relatedPost", "content image");
+
+      emitNotification(req, post.author, populatedNotification);
+    }
+
+    await post.save();
+    res.status(200).json(post);
+  } catch (error) {
+    console.log("Error in likePost Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const bookmarkPost = async (req, res) => {
+  try {
+    const postId = req.params.id;
+    const userId = req.user._id;
+
+    const posts = await Post.findById(postId);
+    if (posts.bookmarks.includes(userId)) {
+      posts.bookmarks = posts.bookmarks.filter((id) => id.toString() !== userId.toString());
+    } else {
+      posts.bookmarks.push(userId);
+    }
+
+    await posts.save();
+    res.json(posts);
+  } catch (error) {
+    console.log("Error in bookmarkPost Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const getBookmarkPosts = async (req, res) => {
+  try {
+    const userId = req.user._id;
+
+    const posts = await Post.find({ bookmarks: userId })
+      .sort({ createdAt: -1 })
+      .populate("author", "name username avatar bio followers following")
+      .populate("comments.user", "name username avatar bio followers following");
+
+    res.status(200).json(posts);
+  } catch (error) {
+    console.log("Error in getBookmarkPosts Controller", error.message);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const getTrendingHashtags = async (req, res) => {
+  try {
+    const hashtagAggregation = await Post.aggregate([
+      { $match: { content: { $exists: true, $ne: "" } } },
+      { $project: { hashtags: { $regexFindAll: { input: "$content", regex: "#\\w+" } } } },
+      { $unwind: "$hashtags" },
+      { $group: { _id: "$hashtags.match", count: { $sum: 1 } } },
+      { $sort: { count: -1 } },
+      { $limit: 5 },
+      { $project: { hashtag: "$_id", count: 1, _id: 0 } },
+    ]);
+
+    res.status(200).json(hashtagAggregation);
+  } catch (error) {
+    console.error("Error in getTrendingHashtags Controller", error.stack);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const searchPosts = async (req, res) => {
+  try {
+    const q = String(req.query.q || "").trim();
+    if (!q) return res.status(200).json([]);
+
+    const escaped = q.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+    const regex = new RegExp(escaped, "i");
+
+    const posts = await Post.find({ content: { $regex: regex } })
+      .sort({ createdAt: -1 })
+      .limit(12)
+      .populate("author", "name username avatar bio followers following");
+
+    res.status(200).json(posts);
+  } catch (error) {
+    console.error("Error in searchPosts Controller", error.stack);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+export const getPostsByHashtag = async (req, res) => {
+  try {
+    const { hashtag } = req.params;
+    const cursor = req.query.cursor || null;
+    const pageSize = 7;
+
+    if (!hashtag) return res.status(400).json({ message: "Hashtag is required" });
+
+    const hashtagRegex = new RegExp(`#${hashtag}\\b`, "i");
+
+    let pipeline = [
+      {
+        $match: {
+          content: hashtagRegex,
+          ...(cursor && mongoose.isValidObjectId(cursor)
+            ? { _id: { $lt: new mongoose.Types.ObjectId(cursor) } }
+            : {}),
+        },
+      },
+      { $addFields: { likesCount: { $size: "$likes" }, commentsCount: { $size: "$comments" } } },
+      { $sort: { likesCount: -1, commentsCount: -1, createdAt: -1 } },
+      { $limit: pageSize + 1 },
+      {
+        $lookup: {
+          from: "users",
+          localField: "author",
+          foreignField: "_id",
+          as: "author",
+          pipeline: [{ $project: { name: 1, username: 1, avatar: 1, bio: 1, followers: 1, following: 1 } }],
+        },
+      },
+      { $unwind: "$author" },
+      {
+        $lookup: {
+          from: "users",
+          localField: "comments.user",
+          foreignField: "_id",
+          as: "commentUsers",
+          pipeline: [{ $project: { name: 1, username: 1, avatar: 1, bio: 1, followers: 1, following: 1 } }],
+        },
+      },
+      {
+        $addFields: {
+          comments: {
+            $map: {
+              input: "$comments",
+              as: "comment",
+              in: {
+                $mergeObjects: [
+                  "$$comment",
+                  { user: { $arrayElemAt: ["$commentUsers", { $indexOfArray: ["$commentUsers._id", "$$comment.user"] }] } },
+                ],
+              },
+            },
+          },
+        },
+      },
+      { $project: { commentUsers: 0 } },
+    ];
+
+    const posts = await Post.aggregate(pipeline);
+    const hasMore = posts.length > pageSize;
+    const nextCursor = hasMore ? posts[pageSize - 1]._id : null;
+
+    res.status(200).json({ posts: posts.slice(0, pageSize), nextCursor, hasMore });
+  } catch (error) {
+    console.error("Error in getPostsByHashtag Controller", error.stack);
+    res.status(500).json({ message: "Server Error" });
+  }
+};
+
+
+
+================ FILE: controllers\reel.controller.js ================
+
+import mongoose from "mongoose";
+import Reel from "../models/reel.model.js";
+import { uploadToClouduinary } from "../lib/cloudinary.js";
+import response from "../lib/responeHandler.js";
+
+/* ─── helpers ─── */
+const POPULATE_AUTHOR  = "name username avatar bio";
+const POPULATE_COMMENT = "name username avatar";
+
+/* ══════════════════════════════════════════════════════
+   GET  /reels/feed?cursor=&limit=
+   Infinite-scroll feed — newest first, cursor-based
+══════════════════════════════════════════════════════ */
+export const getReelFeed = async (req, res) => {
+  try {
+    const limit  = Math.min(parseInt(req.query.limit  || "10"), 20);
+    const cursor = req.query.cursor || null;
+
+    const query = { isPublic: true };
+    if (cursor && mongoose.isValidObjectId(cursor)) {
+      query._id = { $lt: new mongoose.Types.ObjectId(cursor) };
+    }
+
+    const reels = await Reel.find(query)
+      .sort({ createdAt: -1 })
+      .limit(limit + 1)
+      .populate("author", POPULATE_AUTHOR)
+      .populate("comments.user", POPULATE_COMMENT)
+      .lean();
+
+    const hasMore   = reels.length > limit;
+    const data      = hasMore ? reels.slice(0, limit) : reels;
+    const nextCursor = hasMore ? data[data.length - 1]._id : null;
+
+    return response(res, 200, "Reels fetched", { reels: data, nextCursor, hasMore });
+  } catch (err) {
+    console.error("getReelFeed error", err.message);
+    return response(res, 500, "Internal server error");
+  }
+};
+
+/* ══════════════════════════════════════════════════════
+   GET  /reels/user/:userId
+   Profile reels grid
+══════════════════════════════════════════════════════ */
+export const getUserReels = async (req, res) => {
+  try {
+    const { userId } = req.params;
+    if (!mongoose.isValidObjectId(userId)) {
+      return response(res, 400, "Invalid user id");
+    }
+
+    const reels = await Reel.find({ author: userId, isPublic: true })
+      .sort({ createdAt: -1 })
+      .populate("author", POPULATE_AUTHOR)
+      .lean();
+
+    return response(res, 200, "User reels fetched", reels);
+  } catch (err) {
+    console.error("getUserReels error", err.message);
+    return response(res, 500, "Internal server error");
+  }
+};
+
+/* ══════════════════════════════════════════════════════
+   POST /reels/create
+   Upload a new reel (multipart: video in "media" field)
+══════════════════════════════════════════════════════ */
+export const createReel = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const file   = req.file;
+
+    if (!file) {
+      return response(res, 400, "Video file is required");
+    }
+
+    if (!file.mimetype.startsWith("video/")) {
+      return response(res, 400, "Only video files are allowed");
+    }
+
+    // Upload to Cloudinary
+    const upload = await uploadToClouduinary(file);
+    if (!upload?.secure_url) {
+      return response(res, 500, "Video upload failed");
+    }
+
+    const { caption = "", audioName = "Original Audio" } = req.body;
+
+    const reel = new Reel({
+      author:    userId,
+      videoUrl:  upload.secure_url,
+      thumbnailUrl: upload.thumbnail_url || null,
+      duration:  upload.duration || 0,
+      caption,
+      audioName,
+    });
+
+    await reel.save();
+
+    const populated = await Reel.findById(reel._id)
+      .populate("author", POPULATE_AUTHOR)
+      .lean();
+
+    return response(res, 201, "Reel created successfully", populated);
+  } catch (err) {
+    console.error("createReel error", err.message);
+    return response(res, 500, "Internal server error");
+  }
+};
+
+/* ══════════════════════════════════════════════════════
+   DELETE /reels/:reelId
+══════════════════════════════════════════════════════ */
+export const deleteReel = async (req, res) => {
+  try {
+    const { reelId } = req.params;
+    const userId     = req.user._id;
+
+    const reel = await Reel.findById(reelId);
+    if (!reel) return response(res, 404, "Reel not found");
+
+    if (reel.author.toString() !== userId.toString()) {
+      return response(res, 403, "Not authorized to delete this reel");
+    }
+
+    await reel.deleteOne();
+    return response(res, 200, "Reel deleted successfully");
+  } catch (err) {
+    console.error("deleteReel error", err.message);
+    return response(res, 500, "Internal server error");
+  }
+};
+
+/* ══════════════════════════════════════════════════════
+   POST /reels/:reelId/like
+   Toggle like
+══════════════════════════════════════════════════════ */
+export const likeReel = async (req, res) => {
+  try {
+    const { reelId } = req.params;
+    const userId     = req.user._id;
+
+    const reel = await Reel.findById(reelId);
+    if (!reel) return response(res, 404, "Reel not found");
+
+    const liked = reel.likes.some((id) => id.toString() === userId.toString());
+
+    if (liked) {
+      reel.likes = reel.likes.filter((id) => id.toString() !== userId.toString());
+    } else {
+      reel.likes.push(userId);
+    }
+
+    await reel.save();
+    return response(res, 200, liked ? "Unliked" : "Liked", {
+      liked: !liked,
+      likesCount: reel.likes.length,
+    });
+  } catch (err) {
+    console.error("likeReel error", err.message);
+    return response(res, 500, "Internal server error");
+  }
+};
+
+/* ══════════════════════════════════════════════════════
+   POST /reels/:reelId/comment
+   Add comment
+══════════════════════════════════════════════════════ */
+export const commentReel = async (req, res) => {
+  try {
+    const { reelId }  = req.params;
+    const userId      = req.user._id;
+    const { content } = req.body;
+
+    if (!content?.trim()) return response(res, 400, "Comment content required");
+
+    const reel = await Reel.findByIdAndUpdate(
+      reelId,
+      { $push: { comments: { user: userId, content: content.trim() } } },
+      { new: true }
+    ).populate("comments.user", POPULATE_COMMENT);
+
+    if (!reel) return response(res, 404, "Reel not found");
+
+    const newComment = reel.comments[reel.comments.length - 1];
+    return response(res, 201, "Comment added", newComment);
+  } catch (err) {
+    console.error("commentReel error", err.message);
+    return response(res, 500, "Internal server error");
+  }
+};
+
+/* ══════════════════════════════════════════════════════
+   PUT /reels/:reelId/view
+   Register a view (once per user)
+══════════════════════════════════════════════════════ */
+export const viewReel = async (req, res) => {
+  try {
+    const { reelId } = req.params;
+    const userId     = req.user._id;
+
+    const reel = await Reel.findById(reelId).select("views viewCount");
+    if (!reel) return response(res, 404, "Reel not found");
+
+    if (!reel.views.some((id) => id.toString() === userId.toString())) {
+      reel.views.push(userId);
+      reel.viewCount += 1;
+      await reel.save();
+    }
+
+    return response(res, 200, "View registered");
+  } catch (err) {
+    console.error("viewReel error", err.message);
+    return response(res, 500, "Internal server error");
+  }
+};
+
+/* ══════════════════════════════════════════════════════
+   GET /reels/:reelId/comments
+   Paginated comments for a reel
+══════════════════════════════════════════════════════ */
+export const getReelComments = async (req, res) => {
+  try {
+    const { reelId } = req.params;
+
+    const reel = await Reel.findById(reelId)
+      .select("comments")
+      .populate("comments.user", POPULATE_COMMENT)
+      .lean();
+
+    if (!reel) return response(res, 404, "Reel not found");
+
+    // Return newest first
+    const comments = [...reel.comments].reverse();
+    return response(res, 200, "Comments fetched", comments);
+  } catch (err) {
+    console.error("getReelComments error", err.message);
+    return response(res, 500, "Internal server error");
+  }
+};
+
+
+================ FILE: controllers\status.controller.js ================
+
+import { uploadToClouduinary } from "../lib/cloudinary.js";
+import Status from "../models/status.model.js";
+import response from "../lib/responeHandler.js";
+
+export const createStatus = async (req, res) => {
+  try {
+    const { content, contentType } = req.body;
+    const userId = req.user._id;
+    const file = req.file || (Array.isArray(req.files) ? req.files[0] : null);
+
+    let mediaUrl = null;
+    let finalContentType = contentType || "text";
+
+    if (file) {
+      const uploadFile = await uploadToClouduinary(file);
+      if (!uploadFile?.secure_url) {
+        return response(res, 400, "Failed to Upload file");
+      }
+      mediaUrl = uploadFile.secure_url;
+
+      // FIX: was startswith (lowercase), must be startsWith
+      if (file.mimetype.startsWith("video")) {
+        finalContentType = "video";
+      } else if (file.mimetype.startsWith("image")) {
+        finalContentType = "image";
+      } else {
+        return response(res, 400, "Unsupported file type");
+      }
+    } else if (content && content.trim()) {
+      finalContentType = "text";
+    } else {
+      return response(res, 400, "Message content is required");
+    }
+
+    const expiresAt = new Date();
+    expiresAt.setHours(expiresAt.getHours() + 24);
+
+    const status = new Status({
+      user: userId,
+      content: mediaUrl || content,
+      contentType: finalContentType || "text",
+      expiresAt,
+    });
+
+    await status.save();
+
+    const populateStatus = await Status.findById(status._id)
+      .populate("user", "username avatar profilePicture")
+      .populate("viewers", "username avatar profilePicture");
+
+    // Broadcast to connected users
+    if (req.io && req.socketUserMap) {
+      for (const [connectedUserId, socketId] of req.socketUserMap) {
+        if (connectedUserId !== String(userId)) {
+          req.io.to(socketId).emit("new_status", populateStatus);
+        }
+      }
+    }
+
+    return response(res, 201, "Status created successfully", populateStatus);
+  } catch (error) {
+    console.log("Error on createStatus controller", error.message);
+    return response(res, 500, "Internal server Error");
+  }
+};
+
+export const getStatuses = async (req, res) => {
+  try {
+    const statuses = await Status.find({
+      expiresAt: { $gt: new Date() },
+    })
+      .populate("user", "username avatar profilePicture")
+      .populate("viewers", "username avatar profilePicture")
+      .sort({ createdAt: -1 });
+
+    return response(res, 200, "status retrieved", statuses);
+  } catch (error) {
+    console.log("Error on getStatuses controller", error.message);
+    return response(res, 500, "Internal server Error");
+  }
+};
+
+export const viewStatus = async (req, res) => {
+  try {
+    const { statusId } = req.params;
+    const userId = req.user._id;
+
+    const status = await Status.findById(statusId);
+
+    if (!status) {
+      return response(res, 404, "Status not found");
+    }
+
+    const alreadyViewed = status.viewers?.some(
+      (viewerId) => String(viewerId) === String(userId)
+    );
+
+    if (!alreadyViewed) {
+      status.viewers.push(userId);
+      await status.save();
+
+      const updateStatus = await Status.findById(statusId)
+        .populate("user", "username avatar profilePicture")
+        .populate("viewers", "username avatar profilePicture");
+
+      if (req.io && req.socketUserMap) {
+        const statusOwnerSocketId = req.socketUserMap.get(
+          status.user.toString()
+        );
+
+        if (statusOwnerSocketId) {
+          req.io.to(statusOwnerSocketId).emit("status_viewed", {
+            statusId,
+            viewerId: userId,
+            totalViewers: updateStatus.viewers.length,
+            viewers: updateStatus.viewers,
+          });
+        }
+      }
+    }
+
+    return response(res, 200, "status viewed successfully");
+  } catch (error) {
+    console.log("Error on viewStatus controller", error.message);
+    return response(res, 500, "Internal server Error");
+  }
+};
+
+export const deleteStatus = async (req, res) => {
+  try {
+    const { statusId } = req.params;
+    const userId = req.user._id;
+
+    const status = await Status.findById(statusId);
+
+    if (!status) {
+      return response(res, 404, "Status not found");
+    }
+
+    // FIX: was comparing .toString() !== userId (missing toString on userId)
+    if (status.user.toString() !== userId.toString()) {
+      return response(res, 403, "You are not authorized to delete this status");
+    }
+
+    await status.deleteOne();
+
+    if (req.io && req.socketUserMap) {
+      for (const [connectedUserId, socketId] of req.socketUserMap) {
+        if (connectedUserId !== String(userId)) {
+          req.io.to(socketId).emit("status_deleted", statusId);
+        }
+      }
+    }
+
+    // FIX: was return res.status(res, 201, ...) — res.status takes a number not res
+    return response(res, 200, "Status deleted successfully");
+  } catch (error) {
+    console.log("Error on deleteStatus controller", error.message);
+    return response(res, 500, "Internal server Error");
+  }
+};
+
+
+
+================ FILE: controllers\user.controllers.js ================
+
+import User from "../models/user.model.js";
+import cloudinary from "../lib/cloudinary.js";
+import Post from "../models/post.model.js";
+
+import Conversation from "../models/conversation.model.js";
+import response from "../lib/responeHandler.js";
+
+export const getSuggestions = async (req, res) => {
+  try {
+    const userId = req.user._id;
+    const followers = req.user.followers;
+    const following = req.user.following;
+    const user = await User.find({
+      _id: {
+        $ne: userId,
+        $nin: [...followers, ...following],
+      },
+    }).limit(3);
+
+    if (!user) {
+      return res.status(400).json({ message: "User not Found" });
+    }
+
+    res.json(user);
+  } catch (error) {
+    console.log("Error in getSuggestions controller", error.message);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+export const getProfile = async (req, res) => {
+  try {
+    const user = await User.findOne({ username: req.params.username }).select(
+      "-password"
+    );
+
+    if (!user) {
+      return res.status(400).json({ message: "User not Found" });
+    }
+
+    const postsCount = await Post.countDocuments({ author: user._id });
+    const userObj = user.toObject();
+    userObj.postsCount = postsCount;
+
+    res.json(userObj);
+  } catch (error) {
+    console.log("Error in getProfile controller", error.message);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const updateProfile = async (req, res) => {
+  try {
+    const isDataUrl = (value) =>
+      typeof value === "string" && value.startsWith("data:image");
+
+    const allowedFields = [
+      "name",
+      "username",
+      "avatar",
+      "bannerImage",
+      "bio",
+      "location",
+      "website",
+    ];
+
+    const updatedData = {};
+
+    for (const field of allowedFields) {
+      if (req.body[field]) {
+        updatedData[field] = req.body[field];
+      }
+    }
+
+    if (req.body.avatar) {
+      if (isDataUrl(req.body.avatar)) {
+        const result = await cloudinary.uploader.upload(req.body.avatar);
+        updatedData.avatar = result.secure_url;
+      } else {
+        updatedData.avatar = req.body.avatar;
+      }
+    }
+
+    const bannerValue =
+      req.body.bannerImage || req.body.bannerImg || req.body.bannarImg;
+    if (bannerValue) {
+      if (isDataUrl(bannerValue)) {
+        const result = await cloudinary.uploader.upload(bannerValue);
+        updatedData.bannerImage = result.secure_url;
+      } else {
+        updatedData.bannerImage = bannerValue;
+      }
+    }
+
+    const user = await User.findByIdAndUpdate(
+      req.user._id,
+      { $set: updatedData },
+      { new: true }
+    ).select("-password");
+
+    res.status(200).json(user);
+  } catch (error) {
+    console.log("Error in updateProfile controller", error.message);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const getUserByUsername = async (req, res) => {
+  try {
+    const username = req.params.username;
+    const user = await User.findOne({ username }).select("-password");
+    if (!user) {
+      return res.status(404).json({ message: "User not found" });
+    }
+    res.json(user);
+  } catch (error) {
+    console.log("Error in getUserByUsername controller", error.message);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const searchUsers = async (req, res) => {
+  try {
+    const { q } = req.query; // Query parameter for search (e.g., /search?q=john)
+    if (!q || q.trim().length < 1) {
+      return res.status(400).json({ message: "Search query is required" });
+    }
+
+    const users = await User.find({
+      $or: [
+        { username: { $regex: q, $options: "i" } }, // Case-insensitive partial match
+        { name: { $regex: q, $options: "i" } },
+      ],
+      _id: { $ne: req.user._id }, // Exclude the authenticated user
+    })
+      .select("-password")
+      .limit(10); // Limit to 10 results for performance
+
+    res.json(users);
+  } catch (error) {
+    console.log("Error in searchUsers controller", error.message);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+export const getAllUsers = async (req, res) => {
+  try {
+    const loggedUser = req.user._id;
+
+    const users = await User.find({ _id: { $ne: loggedUser } })
+      .select("username avatar lastSeen isOnline bio")
+      .lean();
+
+    const userWithConversation = await Promise.all(
+      users.map(async (user) => {
+        const conversation = await Conversation
+          .findOne({
+            participants: { $all: [loggedUser, user._id] },
+          })
+          .populate({
+            path: "lastMessage",
+            select: "content createdAt sender receiver",
+          })
+          .lean();
+
+        return {
+          ...user,
+          conversation, // will be object or null
+        };
+      })
+    );
+
+    return response(
+      res,
+      200,
+      "users retrieved successfully",
+      userWithConversation
+    );
+  } catch (error) {
+    console.error("Error in getAllUsers controller:", error);
+    res.status(500).json({ message: "Server error" });
+  }
+};
+
+
+
+
+================ FILE: emailService.unit.test.js ================
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import { CompositeEmailService } from "./lib/email.service.js";
+
+test("CompositeEmailService falls back to direct when queue fails", async () => {
+  let directCalled = 0;
+  const queueSender = {
+    send: async () => {
+      throw new Error("queue down");
+    },
+  };
+  const directSender = {
+    send: async () => {
+      directCalled += 1;
+      return { provider: "direct", status: "sent" };
+    },
+  };
+
+  const service = new CompositeEmailService({ queueSender, directSender });
+  const result = await service.sendVerificationEmail({
+    user: { email: "test@example.com", name: "Test", _id: "user1" },
+    token: "plain-token",
+  });
+
+  assert.equal(directCalled, 1);
+  assert.equal(result.provider, "direct");
+});
+
+
+
+================ FILE: lib\audit.js ================
+
+import AuditLog from "../models/auditLog.model.js";
+import { logError } from "./logger.js";
+
+export const audit = async ({
+  action,
+  userId,
+  ip,
+  userAgent,
+  metadata = {},
+}) => {
+  try {
+    await AuditLog.create({
+      action,
+      userId,
+      ip,
+      userAgent,
+      metadata,
+    });
+  } catch (error) {
+    logError("audit.log_failed", { action, error: error.message });
+  }
+};
+
+
+
+================ FILE: lib\auth.config.js ================
+
+export const AUTH_CONFIG = {
+  accessTokenMinutes: Number.parseInt(process.env.ACCESS_TOKEN_MINUTES || "15", 10),
+  refreshTokenDays: Number.parseInt(process.env.REFRESH_TOKEN_DAYS || "30", 10),
+  verifyTokenMinutes: Number.parseInt(
+    process.env.TOKEN_EXPIRES_MINUTES_VERIFY || "1440",
+    10
+  ),
+  resetTokenMinutes: Number.parseInt(
+    process.env.TOKEN_EXPIRES_MINUTES_PWD_RESET || "60",
+    10
+  ),
+  maxFailedLogins: Number.parseInt(process.env.MAX_FAILED_LOGINS || "5", 10),
+  lockoutDurationMinutes: Number.parseInt(
+    process.env.LOCKOUT_DURATION_MIN || "30",
+    10
+  ),
+  loginRateLimitPerIp: Number.parseInt(
+    process.env.LOGIN_RATE_LIMIT_PER_IP || "20",
+    10
+  ),
+  loginRateLimitWindowSec: Number.parseInt(
+    process.env.LOGIN_RATE_LIMIT_WINDOW_SEC || "300",
+    10
+  ),
+  resetRateLimitPerIp: Number.parseInt(
+    process.env.RESET_RATE_LIMIT_PER_IP || "5",
+    10
+  ),
+  resetRateLimitWindowSec: Number.parseInt(
+    process.env.RESET_RATE_LIMIT_WINDOW_SEC || "300",
+    10
+  ),
+  resendVerifyWindowSec: Number.parseInt(
+    process.env.RESEND_VERIFY_WINDOW_SEC || "60",
+    10
+  ),
+};
+
+
+
+================ FILE: lib\authCookies.js ================
+
+import { setCsrfCookie } from "./csrf.js";
+
+export const setAuthCookies = ({ res, accessToken, refreshToken, csrfToken }) => {
+  const cookieOptions = {
+    httpOnly: true,
+    sameSite: "strict",
+    secure: process.env.NODE_ENV === "production",
+  };
+  const accessMinutes = Number.parseInt(process.env.ACCESS_TOKEN_MINUTES || "15", 10);
+  const refreshDays = Number.parseInt(process.env.REFRESH_TOKEN_DAYS || "30", 10);
+
+  res.cookie("jwt_social", accessToken, {
+    ...cookieOptions,
+    maxAge: accessMinutes * 60 * 1000,
+  });
+
+  if (refreshToken) {
+    res.cookie("refresh_token", refreshToken, {
+      ...cookieOptions,
+      maxAge: refreshDays * 24 * 60 * 60 * 1000,
+    });
+  }
+
+  if (csrfToken) {
+    setCsrfCookie(res, csrfToken);
+  }
+};
+
+export const clearAuthCookies = (res) => {
+  res.clearCookie("jwt_social");
+  res.clearCookie("refresh_token");
+  res.clearCookie("csrf_token");
+};
+
+
+
+================ FILE: lib\cache.js ================
+
+import { createClient } from "redis";
+import dotenv from "dotenv";
+
+dotenv.config();
+
+const memoryStore = new Map();
+
+let redisClient = null;
+let redisReady = false;
+
+const initRedis = async () => {
+  if (!process.env.REDIS_URL) return;
+  try {
+    redisClient = createClient({ url: process.env.REDIS_URL });
+    redisClient.on("error", () => {
+      redisReady = false;
+    });
+    await redisClient.connect();
+    redisReady = true;
+    console.log("Redis connected for cache");
+  } catch (error) {
+    redisReady = false;
+    console.log("Redis unavailable, falling back to memory cache");
+  }
+};
+
+initRedis();
+
+const getEntry = (key) => {
+  const entry = memoryStore.get(key);
+  if (!entry) return null;
+  if (entry.expiresAt && entry.expiresAt <= Date.now()) {
+    memoryStore.delete(key);
+    return null;
+  }
+  return entry;
+};
+
+const setMemory = (key, value, ttlSeconds) => {
+  const expiresAt = ttlSeconds ? Date.now() + ttlSeconds * 1000 : null;
+  memoryStore.set(key, { value, expiresAt });
+};
+
+export const cache = {
+  async get(key) {
+    if (redisReady) {
+      return redisClient.get(key);
+    }
+    const entry = getEntry(key);
+    return entry ? entry.value : null;
+  },
+  async set(key, value, options = {}) {
+    const ttlSeconds = options.EX ?? null;
+    if (redisReady) {
+      if (ttlSeconds) {
+        await redisClient.set(key, value, { EX: ttlSeconds });
+        return;
+      }
+      await redisClient.set(key, value);
+      return;
+    }
+    setMemory(key, value, ttlSeconds);
+  },
+  async del(key) {
+    if (redisReady) {
+      await redisClient.del(key);
+      return;
+    }
+    memoryStore.delete(key);
+  },
+  async incr(key, ttlSeconds) {
+    if (redisReady) {
+      const count = await redisClient.incr(key);
+      if (ttlSeconds && count === 1) {
+        await redisClient.expire(key, ttlSeconds);
+      }
+      return count;
+    }
+
+    const entry = getEntry(key);
+    if (!entry) {
+      setMemory(key, 1, ttlSeconds);
+      return 1;
+    }
+    const nextValue = Number(entry.value || 0) + 1;
+    setMemory(key, nextValue, ttlSeconds ?? null);
+    return nextValue;
+  },
+};
+
+export const isRedisReady = () => redisReady;
+
+
+
+================ FILE: lib\cloudinary.js ================
+
+
+import {v2 as cloudinary} from 'cloudinary';
+import dotenv from 'dotenv';
+import multer from 'multer';
+import * as fs from 'fs'
+
+dotenv.config();
+
+cloudinary.config({
+    cloud_name:process.env.CLOUDINARY_CLOUD_NAME,
+    api_key:process.env.CLOUDINARY_API_KEY,
+    api_secret:process.env.CLOUDINARY_SECRET
+});
+
+
+
+export const uploadToClouduinary = (file) =>{
+    const options = {
+        resource_type:file.mimetype.startsWith('video/') ? "video" : "image"
+    };
+
+    return new Promise((resovle,reject ) =>{
+        const uploader = file.mimetype.startsWith('video') ? cloudinary.uploader.upload_large : cloudinary.uploader.upload;
+        uploader(file.path,options,(error,result) =>{
+            fs.unlink(file.path,() =>{})
+            if(error){
+                return reject(error)
+            }
+            resovle(result)
+        })
+    } )
+    
+};
+
+
+export const multerMiddleware = multer({ dest: "uploads/" }).array("media", 10);
+
+
+
+export default cloudinary;
+
+
+================ FILE: lib\csrf.js ================
+
+import crypto from "crypto";
+
+export const generateCsrfToken = () => crypto.randomBytes(24).toString("hex");
+
+export const setCsrfCookie = (res, token) => {
+  res.cookie("csrf_token", token, {
+    httpOnly: false,
+    sameSite: "strict",
+    secure: process.env.NODE_ENV === "production",
+    maxAge: 7 * 24 * 60 * 60 * 1000,
+  });
+};
+
+export const verifyCsrf = (req) => {
+  const headerToken = req.headers["x-csrf-token"];
+  const cookieToken = req.cookies?.csrf_token;
+  return Boolean(headerToken && cookieToken && headerToken === cookieToken);
+};
+
+
+
+================ FILE: lib\db.js ================
+
+import mongoose from "mongoose";
+
+export const connectDB = async () => {
+  try {
+    const conn = await mongoose.connect(process.env.MONGODB_URL);
+    console.log("Mongodb is connected on", conn.connection.host);
+  } catch (error) {
+    console.log("Error while connecting to Database", { error });
+    process.exit(1);
+  }
+};
+
+
+
+================ FILE: lib\email.direct.js ================
+
+import nodemailer from "nodemailer";
+import { logError, logInfo } from "./logger.js";
+
+const buildTransporter = () => {
+  const host = process.env.EMAIL_SMTP_HOST;
+  const port = Number.parseInt(process.env.EMAIL_SMTP_PORT || "465", 10);
+  const secure = process.env.EMAIL_SMTP_SECURE
+    ? process.env.EMAIL_SMTP_SECURE === "true"
+    : port === 465;
+
+  if (!host) {
+    return null;
+  }
+
+  return nodemailer.createTransport({
+    host,
+    port,
+    secure,
+    auth: {
+      user: process.env.EMAIL_SMTP_USER,
+      pass: process.env.EMAIL_SMTP_PASS,
+    },
+  });
+};
+
+export class DirectEmailSender {
+  constructor() {
+    this.transporter = buildTransporter();
+  }
+
+  async send(message) {
+    if (process.env.EMAIL_DRY_RUN === "true") {
+      logInfo("email.direct.dry_run", { to: message.to, subject: message.subject });
+      return { provider: "direct", status: "sent" };
+    }
+
+    if (!this.transporter) {
+      const error = new Error("SMTP not configured");
+      logError("email.direct.config_missing", { error: error.message });
+      throw error;
+    }
+
+    const fromName = process.env.EMAIL_FROM_NAME || "Social Media App";
+    const fromAddress = process.env.EMAIL_FROM_ADDRESS || "no-reply@example.com";
+
+    await this.transporter.sendMail({
+      from: `"${fromName}" <${fromAddress}>`,
+      to: message.to,
+      subject: message.subject,
+      text: message.text,
+      html: message.html,
+    });
+
+    logInfo("email.direct.sent", { to: message.to, subject: message.subject });
+    return { provider: "direct", status: "sent" };
+  }
+}
+
+
+
+================ FILE: lib\email.js ================
+
+import { QueueEmailSender } from "./email.queue.js";
+import { DirectEmailSender } from "./email.direct.js";
+import { CompositeEmailService } from "./email.service.js";
+import { startEmailQueueWorker } from "./email.worker.js";
+import { startRetryWorker } from "./email.retry.js";
+
+export const createEmailService = () => {
+  const directSender = new DirectEmailSender();
+  const queueSender = new QueueEmailSender({
+    queueName: process.env.EMAIL_QUEUE_NAME || "email-send",
+    timeoutMs: Number.parseInt(process.env.RABBITMQ_TIMEOUT_MS || "1500", 10),
+  });
+  const emailService = new CompositeEmailService({ queueSender, directSender });
+  return { emailService, directSender };
+};
+
+export const startEmailWorkers = ({ directSender }) => {
+  startEmailQueueWorker({
+    directSender,
+    queueName: process.env.EMAIL_QUEUE_NAME || "email-send",
+  });
+  startRetryWorker(directSender);
+};
+
+
+
+================ FILE: lib\email.queue.js ================
+
+import amqp from "amqplib";
+import { logInfo, logWarn } from "./logger.js";
+
+const buildRabbitUrl = () => {
+  if (process.env.RABBITMQ_URL) return process.env.RABBITMQ_URL;
+  const host = process.env.RABBITMQ_HOST || "localhost";
+  const port = process.env.RABBITMQ_PORT || "5672";
+  const user = process.env.RABBITMQ_USERNAME || "guest";
+  const pass = process.env.RABBITMQ_PASSWORD || "guest";
+  return `amqp://${user}:${pass}@${host}:${port}`;
+};
+
+const withTimeout = (promise, timeoutMs) =>
+  Promise.race([
+    promise,
+    new Promise((_, reject) =>
+      setTimeout(() => reject(new Error("RabbitMQ timeout")), timeoutMs)
+    ),
+  ]);
+
+export class QueueEmailSender {
+  constructor({ queueName = "email-send", timeoutMs = 1500 } = {}) {
+    this.queueName = queueName;
+    this.timeoutMs = timeoutMs;
+    this.connection = null;
+    this.channel = null;
+  }
+
+  async connect() {
+    if (this.channel) return;
+    const connection = await withTimeout(amqp.connect(buildRabbitUrl()), this.timeoutMs);
+    const channel = await connection.createChannel();
+    await channel.assertQueue(this.queueName, { durable: true });
+    this.connection = connection;
+    this.channel = channel;
+    logInfo("email.queue.connected", { queue: this.queueName });
+  }
+
+  async send(message) {
+    try {
+      await this.connect();
+      const ok = this.channel.sendToQueue(
+        this.queueName,
+        Buffer.from(JSON.stringify(message)),
+        { persistent: true }
+      );
+      if (!ok) {
+        throw new Error("Queue backpressure");
+      }
+      return { provider: "queue", status: "queued" };
+    } catch (error) {
+      logWarn("email.queue.failed", { error: error.message });
+      throw error;
+    }
+  }
+}
+
+
+
+================ FILE: lib\email.retry.js ================
+
+import { logInfo, logWarn } from "./logger.js";
+
+const retryQueue = [];
+const MAX_ATTEMPTS = Number.parseInt(process.env.EMAIL_MAX_RETRIES || "5", 10);
+
+const getBackoffMs = (attempt) =>
+  Math.min(60000, 500 * Math.pow(2, Math.max(0, attempt - 1)));
+
+export const enqueueRetry = (message, attempt = 1) => {
+  if (attempt > MAX_ATTEMPTS) {
+    logWarn("email.retry.exhausted", { messageId: message.messageId });
+    return;
+  }
+  const nextAttemptAt = Date.now() + getBackoffMs(attempt);
+  retryQueue.push({ message, attempt, nextAttemptAt });
+  logInfo("email.retry.queued", {
+    messageId: message.messageId,
+    attempt,
+    nextAttemptAt,
+  });
+};
+
+export const startRetryWorker = (directSender) => {
+  setInterval(async () => {
+    const now = Date.now();
+    const dueItems = retryQueue.filter((item) => item.nextAttemptAt <= now);
+    if (!dueItems.length) return;
+
+    retryQueue.splice(
+      0,
+      retryQueue.length,
+      ...retryQueue.filter((item) => item.nextAttemptAt > now)
+    );
+
+    for (const item of dueItems) {
+      try {
+        await directSender.send(item.message);
+        logInfo("email.retry.sent", { messageId: item.message.messageId });
+      } catch (error) {
+        logWarn("email.retry.failed", {
+          messageId: item.message.messageId,
+          error: error.message,
+        });
+        enqueueRetry(item.message, item.attempt + 1);
+      }
+    }
+  }, 1500);
+};
+
+
+
+================ FILE: lib\email.service.js ================
+
+import crypto from "crypto";
+import { buildResetPasswordEmail, buildVerifyEmail } from "./email.templates.js";
+import { enqueueRetry } from "./email.retry.js";
+import { logInfo, logWarn } from "./logger.js";
+
+const delay = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+
+export class CompositeEmailService {
+  constructor({ queueSender, directSender }) {
+    this.queueSender = queueSender;
+    this.directSender = directSender;
+  }
+
+  async sendVerificationEmail({ user, token }) {
+    const { subject, html, text } = buildVerifyEmail({
+      name: user.name,
+      token,
+    });
+    const message = {
+      messageId: crypto.randomUUID(),
+      to: user.email,
+      subject,
+      html,
+      text,
+      type: "verify",
+      userId: user._id?.toString(),
+    };
+    return this.sendWithFallback(message);
+  }
+
+  async sendPasswordResetEmail({ user, token }) {
+    const { subject, html, text } = buildResetPasswordEmail({
+      name: user.name,
+      token,
+    });
+    const message = {
+      messageId: crypto.randomUUID(),
+      to: user.email,
+      subject,
+      html,
+      text,
+      type: "reset",
+      userId: user._id?.toString(),
+    };
+    return this.sendWithFallback(message);
+  }
+
+  async sendWithFallback(message) {
+    if (this.queueSender) {
+      try {
+        const queued = await this.queueSender.send(message);
+        logInfo("email.sent", { messageId: message.messageId, provider: "queue" });
+        return queued;
+      } catch (error) {
+        logWarn("email.queue_unavailable", {
+          messageId: message.messageId,
+          error: error.message,
+        });
+      }
+    }
+
+    return this.sendDirectWithRetry(message);
+  }
+
+  async sendDirectWithRetry(message) {
+    const retrySchedule = [0, 250, 750];
+
+    for (let attempt = 0; attempt < retrySchedule.length; attempt += 1) {
+      if (retrySchedule[attempt] > 0) {
+        await delay(retrySchedule[attempt]);
+      }
+      try {
+        const result = await this.directSender.send(message);
+        logInfo("email.sent", { messageId: message.messageId, provider: "direct" });
+        return result;
+      } catch (error) {
+        logWarn("email.direct_failed", {
+          messageId: message.messageId,
+          attempt: attempt + 1,
+          error: error.message,
+        });
+      }
+    }
+
+    enqueueRetry(message, 1);
+    return { provider: "direct", status: "queued_for_retry" };
+  }
+}
+
+
+
+================ FILE: lib\email.templates.js ================
+
+const appName = process.env.EMAIL_FROM_NAME || "Social Media App";
+
+const getClientUrl = () => process.env.CLIENT_URL || "http://localhost:5173";
+
+export const buildVerifyEmail = ({ name, token }) => {
+  const link = `${getClientUrl()}/verify-email?token=${token}`;
+  return {
+    subject: `${appName} - Verify your email`,
+    text: `Hi ${name || "there"}, verify your email by visiting: ${link}`,
+    html: `
+      <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #111;">
+        <h2 style="margin: 0 0 12px;">Verify your email</h2>
+        <p>Hi ${name || "there"},</p>
+        <p>Thanks for signing up. Please verify your email to activate your account.</p>
+        <p>
+          <a href="${link}" style="display: inline-block; padding: 10px 16px; background: #2563eb; color: #fff; text-decoration: none; border-radius: 6px;">
+            Verify Email
+          </a>
+        </p>
+        <p style="font-size: 12px; color: #555;">If you did not create an account, you can ignore this email.</p>
+      </div>
+    `,
+  };
+};
+
+export const buildResetPasswordEmail = ({ name, token }) => {
+  const link = `${getClientUrl()}/reset-password?token=${token}`;
+  return {
+    subject: `${appName} - Reset your password`,
+    text: `Hi ${name || "there"}, reset your password by visiting: ${link}`,
+    html: `
+      <div style="font-family: Arial, sans-serif; line-height: 1.6; color: #111;">
+        <h2 style="margin: 0 0 12px;">Reset your password</h2>
+        <p>Hi ${name || "there"},</p>
+        <p>We received a request to reset your password. Click below to choose a new one.</p>
+        <p>
+          <a href="${link}" style="display: inline-block; padding: 10px 16px; background: #16a34a; color: #fff; text-decoration: none; border-radius: 6px;">
+            Reset Password
+          </a>
+        </p>
+        <p style="font-size: 12px; color: #555;">If you did not request this, you can ignore this email.</p>
+      </div>
+    `,
+  };
+};
+
+
+
+================ FILE: lib\email.worker.js ================
+
+import amqp from "amqplib";
+import { logInfo, logWarn } from "./logger.js";
+
+const buildRabbitUrl = () => {
+  if (process.env.RABBITMQ_URL) return process.env.RABBITMQ_URL;
+  const host = process.env.RABBITMQ_HOST || "localhost";
+  const port = process.env.RABBITMQ_PORT || "5672";
+  const user = process.env.RABBITMQ_USERNAME || "guest";
+  const pass = process.env.RABBITMQ_PASSWORD || "guest";
+  return `amqp://${user}:${pass}@${host}:${port}`;
+};
+
+export const startEmailQueueWorker = async ({
+  directSender,
+  queueName = "email-send",
+}) => {
+  try {
+    const connection = await amqp.connect(buildRabbitUrl());
+    const channel = await connection.createChannel();
+    await channel.assertQueue(queueName, { durable: true });
+    logInfo("email.worker.started", { queueName });
+
+    channel.consume(
+      queueName,
+      async (msg) => {
+        if (!msg) return;
+        try {
+          const payload = JSON.parse(msg.content.toString());
+          await directSender.send(payload);
+          channel.ack(msg);
+        } catch (error) {
+          logWarn("email.worker.failed", { error: error.message });
+          channel.nack(msg, false, true);
+        }
+      },
+      { noAck: false }
+    );
+  } catch (error) {
+    logWarn("email.worker.unavailable", { error: error.message });
+  }
+};
+
+
+
+================ FILE: lib\logger.js ================
+
+const formatPayload = (payload) => {
+  try {
+    return JSON.stringify(payload);
+  } catch (error) {
+    return String(payload);
+  }
+};
+
+export const logInfo = (event, payload = {}) => {
+  console.log(formatPayload({ level: "info", event, ...payload }));
+};
+
+export const logWarn = (event, payload = {}) => {
+  console.warn(formatPayload({ level: "warn", event, ...payload }));
+};
+
+export const logError = (event, payload = {}) => {
+  console.error(formatPayload({ level: "error", event, ...payload }));
+};
+
+
+
+================ FILE: lib\mail.js ================
+
+import amqp from 'amqplib';
+import dotenv from 'dotenv';
+import nodemailer from 'nodemailer'
+import { generateOtpEmailBody } from './otpEmailTamplate.js';
+
+
+dotenv.config();
+
+
+
+let channel
+
+export const sendOtpToConsumers = async () => {
+  try {
+    const conn = await amqp.connect({
+      protocol: 'amqp',
+      hostname: process.env.RABBITMQ_HOST,
+      port: 5672,
+      username: process.env.RABBITMQ_USERNAME,
+      password: process.env.RABBITMQ_PASSWORD,
+    });
+
+     channel = await conn.createChannel();
+    const queueName = 'send-otp';
+
+    await channel.assertQueue(queueName, { durable: true });
+    console.log('Rabbit-MQ mail services is started listening consumers 🐰🐰');
+
+    channel.consume(queueName, async (msg) => {
+      if (msg) {
+        try {
+          const { to, subject, body } = JSON.parse(msg.content.toString());
+          const otp = body; 
+
+          const transporter = nodemailer.createTransport({
+            host: 'smtp.gmail.com',
+            port: 465,
+            auth: {
+              user: process.env.SMTP_USER,
+              pass: process.env.SMTP_PASSWORD, 
+            },
+          });
+
+          await transporter.sendMail({
+            from: '"(संन्या) Social Media Application" <no-reply@sannya.com>',
+            to,
+            subject,
+            text: `Your OTP is ${otp}. It is valid for 10 minutes.`,
+            html: generateOtpEmailBody({ otp }), 
+          });
+
+          
+
+          console.log(`OTP mail is sent to ${to}`);
+          channel.ack(msg);
+        } catch (error) {
+          console.error('Failed to process message:', error.message);
+        }
+      }
+    }, { noAck: false }); 
+  } catch (error) {
+    console.error('Failed to start RabbitMQ consumer:', error.message);
+  }
+};
+
+
+export const publishToQueue = async(queueName , message) => {
+    if(!channel){
+       console.log("Channel is not inisilized in Rabbit-MQ");
+       return
+    };
+
+    channel.sendToQueue(queueName,Buffer.from(JSON.stringify(message)),{
+        persistent:true
+    })
+}
+
+
+================ FILE: lib\otpEmailTamplate.js ================
+
+// Function to generate OTP email HTML body
+export const generateOtpEmailBody = ({ otp }) => {
+  return `
+    <!DOCTYPE html>
+    <html lang="en">
+    <head>
+      <meta charset="UTF-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1.0">
+      <title>OTP Verification</title>
+    </head>
+    <body style="margin: 0; padding: 0; font-family: Arial, Helvetica, sans-serif; background-color: #f4f4f4;">
+      <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="background-color: #f4f4f4; padding: 20px;">
+        <tr>
+          <td align="center">
+            <table role="presentation" border="0" cellpadding="0" cellspacing="0" width="100%" style="max-width: 600px; background-color: #ffffff; border-radius: 8px; overflow: hidden; box-shadow: 0 2px 4px rgba(0,0,0,0.1);">
+              <!-- Header -->
+              <tr>
+                <td style="background-color: #4CAF50; padding: 20px; text-align: center;">
+                  <h1 style="color: #ffffff; margin: 0; font-size: 24px;">(संन्या) Social Media</h1>
+                </td>
+              </tr>
+              <!-- Content -->
+              <tr>
+                <td style="padding: 30px; text-align: center;">
+                  <h2 style="color: #333333; font-size: 20px; margin: 0 0 20px;">Your One-Time Password (OTP)</h2>
+                  <p style="color: #555555; font-size: 16px; line-height: 1.5; margin: 0 0 20px;">
+                    Hello,
+                  </p>
+                  <p style="color: #555555; font-size: 16px; line-height: 1.5; margin: 0 0 20px;">
+                    To proceed with your verification, please use the following OTP:
+                  </p>
+                  <div style="background-color: #f0f0f0; display: inline-block; padding: 15px 30px; border-radius: 5px; font-size: 24px; font-weight: bold; color: #333333; margin: 20px 0;">
+                    ${otp}
+                  </div>
+                  <p style="color: #555555; font-size: 14px; line-height: 1.5; margin: 0 0 20px;">
+                    This OTP is valid for the next 10 minutes. Do not share it with anyone.
+                  </p>
+                </td>
+              </tr>
+              <!-- Footer -->
+              <tr>
+                <td style="background-color: #f8f8f8; padding: 20px; text-align: center;">
+                  <p style="color: #777777; font-size: 12px; line-height: 1.5; margin: 0;">
+                    If you did not request this OTP, please ignore this email or contact our support team.
+                  </p>
+                  <p style="color: #777777; font-size: 12px; line-height: 1.5; margin: 10px 0 0;">
+                    &copy; 2025 (संन्या) Social Media. All rights reserved.
+                  </p>
+                </td>
+              </tr>
+            </table>
+          </td>
+        </tr>
+      </table>
+    </body>
+    </html>
+  `;
+};
+
+
+================ FILE: lib\password.js ================
+
+import bcrypt from "bcrypt";
+
+const SALT_ROUNDS = Number.parseInt(process.env.BCRYPT_SALT_ROUNDS || "12", 10);
+
+export const hashPassword = async (password) => bcrypt.hash(password, SALT_ROUNDS);
+
+export const comparePassword = async (password, hash) => bcrypt.compare(password, hash);
+
+export const getPasswordStrength = (password = "") => {
+  const rules = [
+    { test: password.length >= 8, hint: "Use at least 8 characters" },
+    { test: /[A-Z]/.test(password), hint: "Add an uppercase letter" },
+    { test: /[a-z]/.test(password), hint: "Add a lowercase letter" },
+    { test: /\d/.test(password), hint: "Add a number" },
+    { test: /[^A-Za-z0-9]/.test(password), hint: "Add a symbol" },
+  ];
+
+  const passed = rules.filter((rule) => rule.test).length;
+  const score = Math.min(4, Math.max(0, passed - 1));
+  const hints = rules.filter((rule) => !rule.test).map((rule) => rule.hint);
+  return { score, hints };
+};
+
+export const validatePassword = (password = "") => {
+  const { score, hints } = getPasswordStrength(password);
+  const ok = score >= 3;
+  return { ok, score, hints };
+};
+
+
+
+================ FILE: lib\rateLimit.js ================
+
+import { cache } from "./cache.js";
+
+export const rateLimit = async ({ key, limit, windowSeconds }) => {
+  const count = await cache.incr(key, windowSeconds);
+  const allowed = count <= limit;
+  const remaining = Math.max(0, limit - count);
+  return { allowed, remaining };
+};
+
+
+
+================ FILE: lib\redis.js ================
+
+import { createClient } from "redis";
+import dotenv from "dotenv"
+
+dotenv.config();
+
+export const redisClient = createClient({
+  url: process.env.REDIS_URL,
+});
+
+redisClient
+  .connect()
+  .then(() => console.log("Redis is connected 🍒🍒"))
+  .catch((err) => console.log(" ❌ error while connecting to redies", err));
+
+
+
+================ FILE: lib\responeHandler.js ================
+
+
+
+
+const response = (res,statusCode, message ,data=null) =>{
+    if(!res){
+        console.log("Reposne is Null");
+        return
+    };
+
+    const responseObj = {
+        status:statusCode < 400 ? "success" : "error",
+        message,data
+    };
+
+
+    return res.status(statusCode).json(responseObj)
+};
+
+
+export default response
+
+
+================ FILE: lib\tokens.js ================
+
+import crypto from "crypto";
+
+export const hashToken = (token) =>
+  crypto.createHash("sha256").update(token).digest("hex");
+
+export const createToken = (type, userId, expiresInMinutes) => {
+  const token = crypto.randomBytes(32).toString("hex");
+  const tokenHash = hashToken(token);
+  const expiresAt = new Date(Date.now() + expiresInMinutes * 60 * 1000);
+  return {
+    token,
+    tokenHash,
+    expiresAt,
+    meta: {
+      type,
+      userId: userId?.toString(),
+    },
+  };
+};
+
+
+
+================ FILE: lib\validators.js ================
+
+const emailRegex = /^[^\s@]+@[^\s@]+\.[^\s@]+$/i;
+const usernameRegex = /^[a-zA-Z0-9_]+$/;
+
+export const normalizeEmail = (email) => email?.trim().toLowerCase();
+
+export const isValidEmail = (email) => emailRegex.test(email || "");
+
+export const isValidUsername = (username) =>
+  usernameRegex.test(username || "") && (username || "").length >= 3;
+
+export const getClientIp = (req) =>
+  req.headers["x-forwarded-for"]?.toString().split(",")[0]?.trim() ||
+  req.socket?.remoteAddress ||
+  "unknown";
+
+
+
+================ FILE: middlewares\auth.middleware.js ================
+
+import jwt from "jsonwebtoken";
+import User from "../models/user.model.js";
+
+
+export const protectRoute = async(req,res,next) =>{
+    try {
+        const bearer = req.headers.authorization;
+        const token =
+          req.cookies?.jwt_social || (bearer ? bearer.split(" ")[1] : null);
+
+        if(!token){
+            return res.status(401).json({message:"Unauthorized token"})
+        };
+
+        const decoded = jwt.verify(token,process.env.JWT_SECRET);
+        if(!decoded){
+            return res.status(401).json({message:'Token not found'});
+        };
+
+        const user = await User.findById(decoded.userId).select("-password");
+
+        if(!user){
+            return res.status(400).json({message:"user not found"})
+        };
+
+        if(!user.emailVerified){
+            return res.status(403).json({message:"Email not verified"})
+        }
+
+        req.user = user;
+        next()
+
+    } catch (error) {
+        console.log("Erorr in protect route MiddleWare",error.message);
+        res.status(401).json({message:"Unauthorized"})
+      
+    }
+}
+
+
+
+================ FILE: middlewares\csrf.middleware.js ================
+
+import { verifyCsrf } from "../lib/csrf.js";
+
+export const csrfProtect = (req, res, next) => {
+  const safeMethods = ["GET", "HEAD", "OPTIONS"];
+  if (safeMethods.includes(req.method)) {
+    return next();
+  }
+  if (!req.cookies?.jwt_social) {
+    return next();
+  }
+  if (!verifyCsrf(req)) {
+    return res.status(403).json({ message: "Invalid CSRF token" });
+  }
+  return next();
+};
+
+
+
+================ FILE: migrate-auth-fields.js ================
+
+import dotenv from "dotenv";
+import mongoose from "mongoose";
+import User from "./models/user.model.js";
+
+dotenv.config();
+
+const run = async () => {
+  try {
+    await mongoose.connect(process.env.MONGODB_URL);
+
+    await User.updateMany(
+      { emailVerified: { $exists: false } },
+      { $set: { emailVerified: false } }
+    );
+    await User.updateMany(
+      { failedLoginAttempts: { $exists: false } },
+      { $set: { failedLoginAttempts: 0 } }
+    );
+    await User.updateMany(
+      { lockoutUntil: { $exists: false } },
+      { $set: { lockoutUntil: null } }
+    );
+
+    console.log("Auth fields migration complete");
+  } catch (error) {
+    console.error("Migration failed", error);
+  } finally {
+    await mongoose.disconnect();
+  }
+};
+
+run();
+
+
+
+================ FILE: models\auditLog.model.js ================
+
+import mongoose from "mongoose";
+
+const auditLogSchema = new mongoose.Schema(
+  {
+    userId: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+    },
+    action: {
+      type: String,
+      required: true,
+      trim: true,
+    },
+    ip: {
+      type: String,
+      default: "",
+    },
+    userAgent: {
+      type: String,
+      default: "",
+    },
+    metadata: {
+      type: Object,
+      default: {},
+    },
+  },
+  { timestamps: true }
+);
+
+auditLogSchema.index({ action: 1, createdAt: -1 });
+auditLogSchema.index({ userId: 1, createdAt: -1 });
+
+const AuditLog = mongoose.model("AuditLog", auditLogSchema);
+
+export default AuditLog;
+
+
+
+================ FILE: models\conversation.model.js ================
+
+import mongoose, { Schema } from "mongoose";
+
+
+
+
+
+const conversationSchema = new Schema({
+    participants:[{type:mongoose.Schema.Types.ObjectId , ref:"User"}],
+    lastMessage:{type:mongoose.Schema.Types.ObjectId , ref:"Message"},
+    unreadCount:{type:Number , default:0}
+
+},{timestamps:true});
+
+
+const Conversation = mongoose.model("Conversation",conversationSchema);
+
+
+export default Conversation;
+
+
+================ FILE: models\follow.model.js ================
+
+import mongoose from "mongoose";
+
+const followSchema = new mongoose.Schema({
+    follower: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        required: true
+    },
+    followed: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        required: true
+    }
+}, { timestamps: true });
+
+const Follow = mongoose.model("Follow", followSchema);
+
+export default Follow;
+
+
+================ FILE: models\message.model.js ================
+
+import mongoose, { Schema } from "mongoose";
+
+const messageSchema = new Schema({
+  conversation: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "Conversation",
+    required: true,
+  },
+  sender: { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  receiver: {
+    type: mongoose.Schema.Types.ObjectId,
+    ref: "User",
+    required: true,
+  },
+  content: { type: String },
+  imageOrVideoUrl: [{ type: String }],
+  contentType: { type: String, enum: ["image", "video", "text"] },
+  reactions: [
+    {
+      user: { type: mongoose.Schema.Types.ObjectId, ref: "User" },
+      emoji: String,
+    },
+  ],
+  messageStatus: { type: String, default: "send" },
+},{timestamps:true});
+
+
+const Message = mongoose.model("Message",messageSchema);
+
+export default Message;
+
+
+
+================ FILE: models\notification.model.js ================
+
+import mongoose from "mongoose";
+
+const notificationSchema = new mongoose.Schema({
+    recipient: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User",
+        required: true
+    },
+    type: {
+        type: String,
+        required: true,
+        enum: ["like", "comment", "follow"]
+    },
+    relatedUser: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User"
+    },
+    relatedPost: {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "Post"
+    },
+    read: {
+        type: Boolean,
+        default: false
+    }
+}, { timestamps: true });
+
+const Notification = mongoose.model("Notification", notificationSchema);
+
+export default Notification;
+
+
+================ FILE: models\post.model.js ================
+
+
+import mongoose from "mongoose";
+
+
+
+const postSchema = new mongoose.Schema({
+    author:{
+        type:mongoose.Schema.Types.ObjectId,
+        ref:"User",
+        required:true
+    },
+    content:{type:String},
+    media:[{
+        url:{type:String},
+        type:{type:String,enum:["image","video"]},
+        publicId:{type:String}
+    }],
+    image:{type:String},
+    likes:[{type:mongoose.Schema.Types.ObjectId , ref:"User" }],
+    bookmarks:[{
+        type:mongoose.Schema.Types.ObjectId , ref:"User"
+    }],
+    comments:[{
+        content:{type:String},
+        user:{type:mongoose.Schema.Types.ObjectId,ref:"User"},
+        createdAt:{type:Date,default:Date.now}
+    }]
+},{timestamps:true});
+
+
+const Post = mongoose.model("Post",postSchema);
+
+
+export default Post;
+
+
+
+================ FILE: models\reel.model.js ================
+
+import mongoose from "mongoose";
+
+const reelCommentSchema = new mongoose.Schema({
+  user:      { type: mongoose.Schema.Types.ObjectId, ref: "User", required: true },
+  content:   { type: String, required: true, maxlength: 300 },
+  createdAt: { type: Date, default: Date.now },
+});
+
+const reelSchema = new mongoose.Schema(
+  {
+    author: {
+      type: mongoose.Schema.Types.ObjectId,
+      ref: "User",
+      required: true,
+    },
+    videoUrl: {
+      type: String,
+      required: true,
+    },
+    thumbnailUrl: {
+      type: String,
+      default: null,
+    },
+    caption: {
+      type: String,
+      default: "",
+      maxlength: 500,
+    },
+    audioName: {
+      type: String,
+      default: "Original Audio",
+    },
+    hashtags: [{ type: String, lowercase: true, trim: true }],
+    likes:    [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+    comments: [reelCommentSchema],
+    views:    [{ type: mongoose.Schema.Types.ObjectId, ref: "User" }],
+    viewCount: { type: Number, default: 0 }, // anonymous view counter
+    duration:  { type: Number, default: 0 }, // seconds
+    isPublic:  { type: Boolean, default: true },
+  },
+  { timestamps: true }
+);
+
+// Index for feed queries
+reelSchema.index({ createdAt: -1 });
+reelSchema.index({ author: 1, createdAt: -1 });
+
+// Extract hashtags from caption before saving
+reelSchema.pre("save", function (next) {
+  if (this.isModified("caption")) {
+    const found = this.caption.match(/#\w+/g) || [];
+    this.hashtags = found.map((h) => h.toLowerCase().replace("#", ""));
+  }
+  next();
+});
+
+const Reel = mongoose.model("Reel", reelSchema);
+export default Reel;
+
+
+================ FILE: models\status.model.js ================
+
+import mongoose, { Schema } from "mongoose";
+
+
+
+
+const statusSchema = new Schema({
+    user:{type:mongoose.Schema.Types.ObjectId,ref:"User",required:true},
+    content:{type:String,required:true},
+    contentType:{type:String,enum:["video","image","text"],default:"text"},
+    viewers:[{type:mongoose.Schema.Types.ObjectId,ref:"User"}],
+    expiresAt:{type:Date}
+},{timestamps:true});
+
+
+const Status = mongoose.model("Status",statusSchema);
+
+export default Status;
+
+
+================ FILE: models\user.model.js ================
+
+import mongoose from "mongoose";
+
+const userSchema = new mongoose.Schema(
+  {
+    name: {
+      type: String,
+      required: true,
+      trim: true
+    },
+    username: {
+      type: String,
+      required: true,
+      unique: true,
+      trim: true,
+      lowercase: true
+    },
+    email: {
+      type: String,
+      required: true,
+      unique: true,
+      trim: true,
+      lowercase: true
+    },
+    password: {
+      type: String,
+      required: false, // Optional for Google users
+      select: false,
+    },
+    googleId: {
+      type: String,
+      unique: true,
+      sparse: true, // Allows null values while maintaining uniqueness
+    },
+    authSource: {
+      type: String,
+      enum: ["local", "google"],
+      default: "local",
+    },
+    emailVerified: {
+      type: Boolean,
+      default: false,
+    },
+    emailVerifiedAt: {
+      type: Date,
+    },
+    verificationTokenHash: {
+      type: String,
+      select: false,
+    },
+    verificationTokenExpiresAt: {
+      type: Date,
+      select: false,
+    },
+    passwordResetTokenHash: {
+      type: String,
+      select: false,
+    },
+    passwordResetTokenExpiresAt: {
+      type: Date,
+      select: false,
+    },
+    failedLoginAttempts: {
+      type: Number,
+      default: 0,
+    },
+    lockoutUntil: {
+      type: Date,
+    },
+    refreshTokenHash: {
+      type: String,
+      select: false,
+    },
+    refreshTokenExpiresAt: {
+      type: Date,
+      select: false,
+    },
+    passwordChangedAt: {
+      type: Date,
+    },
+    avatar: {
+      type: String,
+      default: "https://cdn.pixabay.com/photo/2017/07/18/23/23/user-2517430_1280.png" // Default avatar URL
+    },
+    lastSeen:{
+      type:Date
+    },
+    isOnline:{
+      type:Boolean , 
+      default:false
+    },
+    bannerImage: {
+      type: String,
+      default: "https://cdn.pixabay.com/photo/2020/05/21/11/08/banner-5200272_1280.jpg" // Default banner URL
+    },
+    bio: {
+      type: String,
+      default: "",
+      maxlength: 160 // Common bio length limit (e.g., Twitter/X)
+    },
+    location: {
+      type: String,
+      default: "",
+      maxlength: 50
+    },
+    website: {
+      type: String,
+      default: "",
+      trim: true
+    },
+    isVerified: {
+      type: Boolean,
+      default: false // For verified badges like on Instagram/Twitter
+    },
+    postsCount: {
+      type: Number,
+      default: 0 // Track number of posts
+    },
+   
+    followers: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User"
+      }
+    ],
+    following: [
+      {
+        type: mongoose.Schema.Types.ObjectId,
+        ref: "User"
+      }
+    ]
+  },
+  { timestamps: true }
+);
+
+userSchema.index({ verificationTokenHash: 1 });
+userSchema.index({ passwordResetTokenHash: 1 });
+
+const User = mongoose.model("User", userSchema);
+
+export default User;
+
+
+
+================ FILE: routers\auth.route.js ================
+
+import { Router } from "express";
+import {
+  forgotPassword,
+  getCurrentUser,
+  googleAuth,
+  refreshToken,
+  resendVerification,
+  resetPassword,
+  signIn,
+  signOut,
+  signUp,
+  verifyEmail,
+} from "../controllers/auth.controller.js";
+import { protectRoute } from "../middlewares/auth.middleware.js";
+
+const router = Router();
+
+router.post("/signup", signUp);
+router.post("/signin", signIn);
+router.post("/google-auth", googleAuth);
+router.post("/signout", signOut);
+router.post("/verify", verifyEmail);
+router.post("/resend-verification", resendVerification);
+router.post("/forgot", forgotPassword);
+router.post("/reset", resetPassword);
+router.post("/refresh", refreshToken);
+
+// Legacy aliases (OTP flow deprecated)
+router.post("/forget-password/check", forgotPassword);
+
+router.get("/me", protectRoute, getCurrentUser);
+
+export default router;
+
+
+
+================ FILE: routers\follow.route.js ================
+
+import { Router } from "express";
+import { protectRoute } from "../middlewares/auth.middleware.js";
+import { followUser, getfollowers, getfollowing , unfollowUser} from "../controllers/follow.controller.js";
+
+
+
+const router = Router();
+
+router.get('/:userId/followers' , protectRoute , getfollowers);
+router.post('/:userId/follow' , protectRoute , followUser);
+router.post('/:userId/unfollow' , protectRoute , unfollowUser);
+
+router.get('/:userId/following' , protectRoute , getfollowing);
+
+export default router;
+
+
+================ FILE: routers\message.route.js ================
+
+import { Router } from "express";
+
+import { multerMiddleware } from "../lib/cloudinary.js";
+import { deleteMessage, getConversation, getMessages, markAsRead, sendMessage } from "../controllers/message.controller.js";
+import { protectRoute } from "../middlewares/auth.middleware.js";
+
+
+
+const router = Router();
+
+
+router.post('/send-message',protectRoute,multerMiddleware,sendMessage);
+router.get('/conversations',protectRoute,getConversation)
+router.get('/conversation/:conversationId/messages',protectRoute,getMessages);
+router.put('/messages/read',protectRoute,markAsRead);
+
+router.delete('/messages/:messageId',protectRoute,deleteMessage);
+
+
+
+export default router
+
+
+================ FILE: routers\notification.route.js ================
+
+import { Router } from "express";
+import { protectRoute } from "../middlewares/auth.middleware.js";
+import {
+  deleteNotification,
+  getNotifications,
+  getUnreadNotificationsCount,
+  markAllNotificationsAsRead,
+  markNotificationAsRead,
+} from "../controllers/notification.controller.js";
+
+const router = Router();
+
+router.get("/",               protectRoute, getNotifications);
+router.get("/unread-count",   protectRoute, getUnreadNotificationsCount);
+router.put("/mark-all-read",  protectRoute, markAllNotificationsAsRead);   // ← NEW
+router.put("/:id/read",       protectRoute, markNotificationAsRead);
+router.delete("/:id",         protectRoute, deleteNotification);
+
+export default router;
+
+
+================ FILE: routers\post.route.js ================
+
+import { Router } from "express";
+import { protectRoute } from "../middlewares/auth.middleware.js";
+import {
+  bookmarkPost,
+  createComment,
+  createPost,
+  deletePost,
+  getBookmarkPosts,
+  getFollowingPostFeed,
+  getPostById,
+  getPostFeeds,
+  getPostsByHashtag,
+  getPostsByUsername,
+  getTrendingHashtags,
+  likePost,
+  searchPosts,
+  updatePost,
+} from "../controllers/post.controller.js";
+import { multerMiddleware } from "../lib/cloudinary.js";
+
+
+const router = Router();
+router.get("/hashtag/:hashtag", getPostsByHashtag);
+router.get("/trending-hashtags", getTrendingHashtags);
+router.get("/search", protectRoute, searchPosts);
+router.get("/bookmarks",protectRoute,getBookmarkPosts)
+router.get("/for-you", protectRoute, getPostFeeds);
+router.get("/following", protectRoute, getFollowingPostFeed);
+router.get("/user/:username", protectRoute, getPostsByUsername);
+router.post("/create", protectRoute, multerMiddleware, createPost);
+router.delete("/delete/:id", protectRoute, deletePost);
+router.put("/edit/:id" , protectRoute , multerMiddleware , updatePost);
+router.get("/:id", protectRoute, getPostById);
+router.post("/:id/like", protectRoute, likePost);
+router.post("/:id/comment", protectRoute, createComment);
+router.post("/:id/bookmark", protectRoute, bookmarkPost);
+
+
+
+export default router;
+
+
+
+================ FILE: routers\reel.route.js ================
+
+import { Router } from "express";
+import { protectRoute } from "../middlewares/auth.middleware.js";
+import {
+  getReelFeed,
+  getUserReels,
+  createReel,
+  deleteReel,
+  likeReel,
+  commentReel,
+  viewReel,
+  getReelComments,
+} from "../controllers/reel.controller.js";
+import multer from "multer";
+
+// Use disk storage so uploadToClouduinary can read file.path
+const upload = multer({ dest: "uploads/" });
+
+const router = Router();
+
+// Feed
+router.get("/feed",           protectRoute, getReelFeed);
+router.get("/user/:userId",   protectRoute, getUserReels);
+
+// CRUD
+router.post("/create",        protectRoute, upload.single("media"), createReel);
+router.delete("/:reelId",     protectRoute, deleteReel);
+
+// Interactions
+router.post("/:reelId/like",  protectRoute, likeReel);
+router.post("/:reelId/comment", protectRoute, commentReel);
+router.put("/:reelId/view",   protectRoute, viewReel);
+router.get("/:reelId/comments", protectRoute, getReelComments);
+
+export default router;
+
+
+================ FILE: routers\status.route.js ================
+
+import { Router } from "express";
+
+import { multerMiddleware } from "../lib/cloudinary.js";
+
+import {
+  createStatus,
+  deleteStatus,
+  getStatuses,
+  viewStatus,
+} from "../controllers/status.controller.js";
+import { protectRoute } from "../middlewares/auth.middleware.js";
+
+const router = Router();
+
+router.post("/", protectRoute, multerMiddleware, createStatus);
+router.get("/", protectRoute, getStatuses);
+
+router.put("/:statusId/view", protectRoute, viewStatus);
+
+router.delete("/:statusId", protectRoute, deleteStatus);
+
+
+
+export default router;
+
+
+================ FILE: routers\user.route.js ================
+
+import { Router } from "express";
+import { protectRoute } from "../middlewares/auth.middleware.js";
+import { getProfile, getSuggestions, updateProfile, getUserByUsername, searchUsers, getAllUsers } from "../controllers/user.controllers.js";
+
+
+
+const router  = Router();
+
+router.get('/all',protectRoute,getAllUsers)
+router.get('/',protectRoute,getSuggestions);
+router.get("/search", protectRoute, searchUsers);
+router.get('/:username',protectRoute,getProfile);
+router.put('/profile',protectRoute,updateProfile);
+router.put('/username/:username',protectRoute,getUserByUsername);
+
+export default router
+
+
+================ FILE: server.js ================
+
+
+import dotenv from "dotenv";
+import http from "http";
+import createApp from "./app.js";
+import { connectDB } from "./lib/db.js";
+import { initializeSocket } from "./socket/socket.js";
+import { createEmailService, startEmailWorkers } from "./lib/email.js";
+
+dotenv.config();
+
+const PORT = process.env.PORT || 5000;
+
+let io;
+const { emailService, directSender } = createEmailService();
+
+const app = createApp({
+  emailService,
+  getIo: () => io,
+});
+
+const server = http.createServer(app);
+io = initializeSocket(server);
+
+const start = async () => {
+  await connectDB();
+  server.listen(PORT, () => {
+    console.log("Server is Running on ", PORT);
+    startEmailWorkers({ directSender });
+  });
+};
+
+start();
+
+
+
+================ FILE: socket\socket.js ================
+
+import { Server } from "socket.io";
+import User from "../models/user.model.js";
+import Message from "../models/message.model.js";
+import Post from "../models/post.model.js";
+
+// Map to find user is online or not -> userId, socketId
+let onlineUsers = new Map();
+
+// Map to track typing status of users in conversation --> userId, [conversation]
+let typingStatus = new Map();
+
+// Map to track active calls -> callId, { callerId, receiverId, callType, status }
+let activeCalls = new Map();
+
+export const initializeSocket = (server) => {
+  const io = new Server(server, {
+    cors: {
+      origin: process.env.CLIENT_URL,
+      credentials: true,
+      methods: ["GET", "PUT", "POST", "DELETE", "OPTIONS"],
+    },
+    pingTimeout: 60000,
+  });
+
+  io.on("connection", (socket) => {
+    console.log("User is connected to SocketId", socket.id);
+
+    let userId = null;
+
+    // ══════════════════════════════════════════════════
+    //  USER CONNECTION
+    // ══════════════════════════════════════════════════
+    try {
+      socket.on("user_connected", async (connectionUserId) => {
+        if (!connectionUserId) {
+          console.warn("❌ user_connected called without userId");
+          return;
+        }
+
+        userId = connectionUserId;
+        onlineUsers.set(userId, socket.id);
+        socket.join(userId);
+
+        await User.findByIdAndUpdate(userId, {
+          isOnline: true,
+          lastSeen: new Date(),
+        });
+
+        io.emit("user_status", {
+          userId,
+          isOnline: true,
+          lastSeen: null,
+        });
+      });
+    } catch (error) {
+      console.error("Error while establishing user connection in socket", error.message);
+    }
+
+    // ══════════════════════════════════════════════════
+    //  ONLINE STATUS
+    // ══════════════════════════════════════════════════
+    socket.on("get_user_status", (requestUserId, callback) => {
+      const isOnline = onlineUsers.has(requestUserId);
+      callback({
+        userId: requestUserId,
+        isOnline,
+        lastSeen: isOnline ? new Date() : null,
+      });
+    });
+
+    // ══════════════════════════════════════════════════
+    //  MESSAGING
+    // ══════════════════════════════════════════════════
+    socket.on("send_message", async (message) => {
+      try {
+        const senderSocketId = onlineUsers.get(message?.sender?._id);
+        const receiverSocketId = onlineUsers.get(message?.receiver?._id);
+        if (senderSocketId) io.to(senderSocketId).emit("send_message", message);
+        if (receiverSocketId) io.to(receiverSocketId).emit("receive_message", message);
+      } catch (error) {
+        console.error("Error while sending message in socket", error.message);
+        socket.emit("message_error", { error: "Failed to send message" });
+      }
+    });
+
+    socket.on("message_read", async ({ messageIds, senderId }) => {
+      try {
+        await Message.updateMany(
+          { _id: { $in: messageIds } },
+          { $set: { messageStatus: "read" } }
+        );
+        const senderSocketId = onlineUsers.get(senderId);
+        if (senderSocketId) {
+          messageIds.forEach((messageId) => {
+            io.to(senderSocketId).emit("message_status_update", {
+              messageId,
+              messageStatus: "read",
+            });
+          });
+        }
+      } catch (error) {
+        console.error("Error updating message status in socket", error.message);
+      }
+    });
+
+    // ══════════════════════════════════════════════════
+    //  TYPING
+    // ══════════════════════════════════════════════════
+    socket.on("typing_start", ({ conversationId, receiverId }) => {
+      if (!userId || !conversationId || !receiverId) return;
+      if (!typingStatus.has(userId)) typingStatus.set(userId, {});
+      const userTyping = typingStatus.get(userId);
+      userTyping[conversationId] = true;
+      if (userTyping[`${conversationId}_timeout`]) {
+        clearTimeout(userTyping[`${conversationId}_timeout`]);
+      }
+      userTyping[`${conversationId}_timeout`] = setTimeout(() => {
+        userTyping[conversationId] = false;
+        socket.to(receiverId).emit("user_typing", { userId, conversationId, isTyping: false });
+      }, 2000);
+      socket.to(receiverId).emit("user_typing", { userId, conversationId, isTyping: true });
+    });
+
+    socket.on("typing_stop", ({ conversationId, receiverId }) => {
+      if (!userId || !conversationId || !receiverId) return;
+      if (typingStatus.has(userId)) {
+        const userTyping = typingStatus.get(userId);
+        userTyping[conversationId] = false;
+        if (userTyping[`${conversationId}_timeout`]) {
+          clearTimeout(userTyping[`${conversationId}_timeout`]);
+          delete userTyping[`${conversationId}_timeout`];
+        }
+      }
+      socket.to(receiverId).emit("user_typing", { userId, conversationId, isTyping: false });
+    });
+
+    // ══════════════════════════════════════════════════
+    //  MESSAGE ACTIONS (delete, react)
+    // ══════════════════════════════════════════════════
+    socket.on("delete_message", async ({ messageId, conversationId }) => {
+      try {
+        await Message.findByIdAndDelete(messageId);
+        const users = io.socketUserMap;
+        users.forEach((socketId) => {
+          io.to(socketId).emit("message_deleted", { messageId, conversationId });
+        });
+      } catch (err) {
+        console.error("Delete message socket error", err.message);
+      }
+    });
+
+    socket.on("add_reaction", async ({ messageId, emoji, userId: reactionUserId }) => {
+      try {
+        const message = await Message.findById(messageId);
+        if (!message) return;
+        const existingIndex = message.reactions.findIndex(
+          (r) => r.user.toString() === reactionUserId
+        );
+        if (existingIndex > -1) {
+          if (message.reactions[existingIndex].emoji === emoji) {
+            message.reactions.splice(existingIndex, 1);
+          } else {
+            message.reactions[existingIndex].emoji = emoji;
+          }
+        } else {
+          message.reactions.push({ user: reactionUserId, emoji });
+        }
+        await message.save();
+        const populatedMessage = await Message.findById(message._id)
+          .populate("sender", "username profilePhoto")
+          .populate("receiver", "username profilePhoto")
+          .populate("reactions.user", "username profilePhoto");
+        const payload = { messageId: populatedMessage._id, reactions: populatedMessage.reactions };
+        const senderSocket = onlineUsers.get(populatedMessage.sender._id.toString());
+        const receiverSocket = onlineUsers.get(populatedMessage.receiver._id.toString());
+        if (senderSocket) io.to(senderSocket).emit("reaction_update", payload);
+        if (receiverSocket) io.to(receiverSocket).emit("reaction_update", payload);
+      } catch (error) {
+        console.error("Error handling reactions in socket", error.message);
+      }
+    });
+
+    // ══════════════════════════════════════════════════
+    //  FOLLOW / UNFOLLOW
+    // ══════════════════════════════════════════════════
+    socket.on("follow_user", async ({ followerId, followedId }) => {
+      try {
+        if (!followedId || !followerId) return;
+        const followedSocketId = onlineUsers.get(followedId);
+        if (followedSocketId) {
+          io.to(followedSocketId).emit("follow_event", { followerId, followedId, type: "follow" });
+        }
+      } catch (error) {
+        console.error("Socket follow error:", error.message);
+      }
+    });
+
+    socket.on("unfollow_user", async ({ followerId, followedId }) => {
+      try {
+        if (!followedId || !followerId) return;
+        const followedSocketId = onlineUsers.get(followedId);
+        if (followedSocketId) {
+          io.to(followedSocketId).emit("unfollow_event", { followerId, followedId, type: "unfollow" });
+        }
+      } catch (error) {
+        console.error("Socket unfollow error:", error.message);
+      }
+    });
+
+    // ══════════════════════════════════════════════════
+    //  POST INTERACTIONS
+    // ══════════════════════════════════════════════════
+    socket.on("like_post", async ({ postId, userId: likeUserId, action }) => {
+      try {
+        if (!postId || !likeUserId) return;
+        const post = await Post.findById(postId).populate("author", "_id");
+        if (!post) return;
+        if (post.author._id.toString() !== likeUserId) {
+          const authorSocketId = onlineUsers.get(post.author._id.toString());
+          if (authorSocketId) {
+            io.to(authorSocketId).emit("post_liked", { postId, userId: likeUserId, action, likesCount: post.likes.length });
+          }
+        }
+        socket.broadcast.emit("post_interaction", { postId, userId: likeUserId, type: "like", action, likesCount: post.likes.length });
+      } catch (error) {
+        console.error("Socket like error:", error.message);
+      }
+    });
+
+    socket.on("bookmark_post", async ({ postId, userId: bookmarkUserId, action }) => {
+      try {
+        if (!postId || !bookmarkUserId) return;
+        socket.broadcast.emit("post_interaction", { postId, userId: bookmarkUserId, type: "bookmark", action });
+      } catch (error) {
+        console.error("Socket bookmark error:", error.message);
+      }
+    });
+
+    socket.on("comment_post", async ({ postId, userId: commentUserId, comment }) => {
+      try {
+        if (!postId || !commentUserId || !comment) return;
+        const post = await Post.findById(postId).populate("author", "_id");
+        if (!post) return;
+        if (post.author._id.toString() !== commentUserId) {
+          const authorSocketId = onlineUsers.get(post.author._id.toString());
+          if (authorSocketId) {
+            io.to(authorSocketId).emit("post_commented", { postId, userId: commentUserId, comment, commentsCount: post.comments.length });
+          }
+        }
+        socket.broadcast.emit("post_interaction", { postId, userId: commentUserId, type: "comment", comment, commentsCount: post.comments.length });
+      } catch (error) {
+        console.error("Socket comment error:", error.message);
+      }
+    });
+
+    // ══════════════════════════════════════════════════
+    //  ████  WEBRTC CALL SIGNALING  ████
+    // ══════════════════════════════════════════════════
+
+    /**
+     * STEP 1 — Caller initiates a call
+     * Payload: { callerId, receiverId, callType: 'video' | 'audio', callerInfo: { name, avatar } }
+     */
+    socket.on("call:initiate", ({ callerId, receiverId, callType, callerInfo }) => {
+      try {
+        if (!callerId || !receiverId) return;
+
+        const receiverSocketId = onlineUsers.get(receiverId);
+
+        // Generate a unique call ID
+        const callId = `${callerId}-${receiverId}-${Date.now()}`;
+
+        // Check if receiver is already in a call
+        const receiverInCall = [...activeCalls.values()].some(
+          (c) =>
+            (c.callerId === receiverId || c.receiverId === receiverId) &&
+            c.status !== "ended"
+        );
+
+        if (receiverInCall) {
+          socket.emit("call:busy", { callId, receiverId });
+          return;
+        }
+
+        // Register call in map
+        activeCalls.set(callId, {
+          callId,
+          callerId,
+          receiverId,
+          callType,
+          status: "ringing",
+        });
+
+        // Forward to receiver
+        if (receiverSocketId) {
+          io.to(receiverSocketId).emit("call:incoming", {
+            callId,
+            callerId,
+            callType,
+            callerInfo,
+          });
+        } else {
+          // Receiver offline
+          socket.emit("call:no_answer", { callId, receiverId });
+          activeCalls.delete(callId);
+        }
+
+        // Confirm to caller that ring was sent
+        socket.emit("call:ringing", { callId });
+
+        console.log(`📞 Call initiated: ${callerId} → ${receiverId} [${callType}] callId:${callId}`);
+      } catch (err) {
+        console.error("call:initiate error", err.message);
+      }
+    });
+
+    /**
+     * STEP 2a — Receiver accepts
+     * Payload: { callId, receiverId }
+     */
+    socket.on("call:accepted", ({ callId, receiverId }) => {
+      try {
+        const call = activeCalls.get(callId);
+        if (!call) return;
+
+        call.status = "connecting";
+        activeCalls.set(callId, call);
+
+        const callerSocketId = onlineUsers.get(call.callerId);
+        if (callerSocketId) {
+          io.to(callerSocketId).emit("call:accepted", { callId, receiverId });
+        }
+
+        console.log(`✅ Call accepted: callId:${callId}`);
+      } catch (err) {
+        console.error("call:accepted error", err.message);
+      }
+    });
+
+    /**
+     * STEP 2b — Receiver rejects
+     * Payload: { callId, reason: 'rejected' | 'busy' }
+     */
+    socket.on("call:rejected", ({ callId, reason }) => {
+      try {
+        const call = activeCalls.get(callId);
+        if (!call) return;
+
+        call.status = "ended";
+        activeCalls.set(callId, call);
+
+        const callerSocketId = onlineUsers.get(call.callerId);
+        if (callerSocketId) {
+          io.to(callerSocketId).emit("call:rejected", { callId, reason });
+        }
+
+        activeCalls.delete(callId);
+        console.log(`❌ Call rejected: callId:${callId} reason:${reason}`);
+      } catch (err) {
+        console.error("call:rejected error", err.message);
+      }
+    });
+
+    /**
+     * STEP 3 — Caller sends WebRTC offer to receiver
+     * Payload: { callId, to, offer }
+     */
+    socket.on("webrtc:offer", ({ callId, to, offer }) => {
+      try {
+        const targetSocketId = onlineUsers.get(to);
+        if (targetSocketId) {
+          io.to(targetSocketId).emit("webrtc:offer", {
+            callId,
+            from: userId,
+            offer,
+          });
+        }
+      } catch (err) {
+        console.error("webrtc:offer error", err.message);
+      }
+    });
+
+    /**
+     * STEP 4 — Receiver sends WebRTC answer back to caller
+     * Payload: { callId, to, answer }
+     */
+    socket.on("webrtc:answer", ({ callId, to, answer }) => {
+      try {
+        const targetSocketId = onlineUsers.get(to);
+        if (targetSocketId) {
+          io.to(targetSocketId).emit("webrtc:answer", {
+            callId,
+            from: userId,
+            answer,
+          });
+          // Mark call as active
+          const call = activeCalls.get(callId);
+          if (call) { call.status = "active"; activeCalls.set(callId, call); }
+        }
+      } catch (err) {
+        console.error("webrtc:answer error", err.message);
+      }
+    });
+
+    /**
+     * STEP 5 — ICE candidate exchange (both directions)
+     * Payload: { callId, to, candidate }
+     */
+    socket.on("webrtc:ice-candidate", ({ callId, to, candidate }) => {
+      try {
+        const targetSocketId = onlineUsers.get(to);
+        if (targetSocketId) {
+          io.to(targetSocketId).emit("webrtc:ice-candidate", {
+            callId,
+            from: userId,
+            candidate,
+          });
+        }
+      } catch (err) {
+        console.error("webrtc:ice-candidate error", err.message);
+      }
+    });
+
+    /**
+     * STEP 6 — Either party ends the call
+     * Payload: { callId, to }
+     */
+    socket.on("call:end", ({ callId, to }) => {
+      try {
+        const call = activeCalls.get(callId);
+        if (call) {
+          call.status = "ended";
+          activeCalls.delete(callId);
+        }
+
+        const targetSocketId = onlineUsers.get(to);
+        if (targetSocketId) {
+          io.to(targetSocketId).emit("call:ended", { callId });
+        }
+
+        console.log(`📴 Call ended: callId:${callId}`);
+      } catch (err) {
+        console.error("call:end error", err.message);
+      }
+    });
+
+    /**
+     * Call media toggle notifications (optional — keeps remote UI in sync)
+     * Payload: { callId, to, muted } / { callId, to, videoOff }
+     */
+    socket.on("call:toggle-audio", ({ callId, to, muted }) => {
+      const targetSocketId = onlineUsers.get(to);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit("call:remote-audio-toggle", { callId, muted });
+      }
+    });
+
+    socket.on("call:toggle-video", ({ callId, to, videoOff }) => {
+      const targetSocketId = onlineUsers.get(to);
+      if (targetSocketId) {
+        io.to(targetSocketId).emit("call:remote-video-toggle", { callId, videoOff });
+      }
+    });
+
+    // ══════════════════════════════════════════════════
+    //  DISCONNECT
+    // ══════════════════════════════════════════════════
+    const handleDisconnect = async () => {
+      try {
+        if (!userId) return;
+
+        // End any active calls involving this user
+        for (const [callId, call] of activeCalls.entries()) {
+          if (call.callerId === userId || call.receiverId === userId) {
+            const otherId = call.callerId === userId ? call.receiverId : call.callerId;
+            const otherSocketId = onlineUsers.get(otherId);
+            if (otherSocketId) {
+              io.to(otherSocketId).emit("call:ended", { callId, reason: "disconnected" });
+            }
+            activeCalls.delete(callId);
+          }
+        }
+
+        onlineUsers.delete(userId);
+
+        if (typingStatus.get(userId)) {
+          const userTyping = typingStatus.get(userId);
+          Object.keys(userTyping).forEach((key) => {
+            if (key.endsWith("_timeout")) clearTimeout(userTyping[key]);
+          });
+          typingStatus.delete(userId);
+        }
+
+        await User.findByIdAndUpdate(userId, {
+          isOnline: false,
+          lastSeen: new Date(),
+        });
+
+        io.emit("user_status", {
+          userId,
+          isOnline: false,
+          lastSeen: new Date(),
+        });
+
+        socket.leave(userId);
+        console.log(`user ${userId} disconnected`);
+      } catch (error) {
+        console.error("Error handling disconnection", error.message);
+      }
+    };
+
+    socket.on("disconnect", handleDisconnect);
+  });
+
+  io.socketUserMap = onlineUsers;
+  return io;
+};
+
+
+================ FILE: tokens.unit.test.js ================
+
+import test from "node:test";
+import assert from "node:assert/strict";
+import { createToken, hashToken } from "./lib/tokens.js";
+
+test("createToken returns hashed token and expiry", () => {
+  const { token, tokenHash, expiresAt } = createToken("verify", "user123", 10);
+  assert.ok(token);
+  assert.ok(tokenHash);
+  assert.notEqual(token, tokenHash);
+  assert.equal(tokenHash, hashToken(token));
+  assert.ok(expiresAt instanceof Date);
+  assert.ok(expiresAt.getTime() > Date.now());
+});
+

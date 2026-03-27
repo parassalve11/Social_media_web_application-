@@ -1,0 +1,71 @@
+{
+  "info": {
+    "name": "Social Media Auth API",
+    "schema": "https://schema.getpostman.com/json/collection/v2.1.0/collection.json"
+  },
+  "variable": [
+    { "key": "baseUrl", "value": "http://localhost:5000/api/v1" }
+  ],
+  "item": [
+    {
+      "name": "Signup",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/auth/signup",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"name\": \"Jane\",\n  \"username\": \"jane\",\n  \"email\": \"jane@example.com\",\n  \"password\": \"StrongPass1!\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Verify Email",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/auth/verify",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"token\": \"<token-from-email>\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Login",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/auth/signin",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"identifier\": \"jane@example.com\",\n  \"password\": \"StrongPass1!\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Forgot Password",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/auth/forgot",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"email\": \"jane@example.com\"\n}"
+        }
+      }
+    },
+    {
+      "name": "Reset Password",
+      "request": {
+        "method": "POST",
+        "header": [{ "key": "Content-Type", "value": "application/json" }],
+        "url": "{{baseUrl}}/auth/reset",
+        "body": {
+          "mode": "raw",
+          "raw": "{\n  \"token\": \"<token-from-email>\",\n  \"newPassword\": \"NewPass1!\"\n}"
+        }
+      }
+    }
+  ]
+}

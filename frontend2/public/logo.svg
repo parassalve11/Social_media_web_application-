@@ -1,0 +1,15 @@
+﻿<?xml version="1.0" encoding="UTF-8"?>
+<svg width="720" height="256" viewBox="0 0 720 256" fill="none" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <linearGradient id="g" x1="32" y1="24" x2="224" y2="232" gradientUnits="userSpaceOnUse">
+      <stop stop-color="#0EA5E9"/>
+      <stop offset="1" stop-color="#22C55E"/>
+    </linearGradient>
+  </defs>
+  <g>
+    <circle cx="128" cy="128" r="116" fill="url(#g)"/>
+    <circle cx="128" cy="128" r="104" fill="white" fill-opacity="0.08"/>
+    <path d="M176 76C176 48 96 48 96 84C96 108 144 110 144 132C144 164 80 164 80 196" stroke="white" stroke-width="26" stroke-linecap="round" stroke-linejoin="round"/>
+  </g>
+  <text x="300" y="160" font-family="Poppins, Segoe UI, Arial, sans-serif" font-size="96" font-weight="700" fill="#0F172A" letter-spacing="2">Sangya</text>
+</svg>

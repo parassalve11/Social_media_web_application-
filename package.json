@@ -1,0 +1,43 @@
+{
+  "name": "social-media-application",
+  "version": "1.0.0",
+  "main": "backend/server.js",
+  "scripts": {
+    "dev": "nodemon backend/server.js",
+    "start": "node backend/server.js",
+    "build": "npm install &&  npm install --prefix frontend &&  npm run build --prefix frontend",
+    "test": "node --test backend/*.test.js",
+    "test:unit": "node --test backend/*.unit.test.js",
+    "test:integration": "node --test backend/*.integration.test.js"
+  },
+  "keywords": [],
+  "author": "",
+  "license": "ISC",
+  "description": "",
+  "type": "module",
+  "dependencies": {
+    "amqplib": "^0.10.8",
+    "bcrypt": "^6.0.0",
+    "cloudinary": "^2.6.1",
+    "cookie-parser": "^1.4.7",
+    "cors": "^2.8.5",
+    "dotenv": "^16.5.0",
+    "express": "^4.21.2",
+    "google-auth-library": "^9.15.1",
+    "icons": "^1.0.0",
+    "jsonwebtoken": "^9.0.2",
+    "lucide": "^0.513.0",
+    "lucide-react": "^0.513.0",
+    "mongodb": "^6.16.0",
+    "mongoose": "^8.15.1",
+    "multer": "^2.0.2",
+    "nodemailer": "^7.0.5",
+    "nodemon": "^3.1.10",
+    "redis": "^5.8.0",
+    "socket.io": "^4.8.1"
+  },
+  "devDependencies": {
+    "mongodb-memory-server": "^9.0.0",
+    "supertest": "^6.3.4"
+  }
+}
