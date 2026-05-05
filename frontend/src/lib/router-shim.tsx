@@ -18,7 +18,7 @@ export const useNavigate = () => {
 };
 
 export const useParams = () => {
-  return useNextParams();
+  return useNextParams() || {};
 };
 
 export const useLocation = () => {
@@ -33,7 +33,7 @@ export const useLocation = () => {
 };
 
 export const useSearchParams = () => {
-  const params = useNextSearchParams();
+  const params = useNextSearchParams() || new URLSearchParams();
   const setParams = () => {};
   return [params, setParams] as const;
 };

@@ -8,9 +8,8 @@ import React, {
   useContext,
 } from "react";
 
-
-
-const ToastContext = createContext();
+const noop = () => {};
+const ToastContext = createContext({ addToast: noop });
 
 const MAX_TOASTS = 5;
 
@@ -159,5 +158,6 @@ const ToastManager = ({ children, position = "top-right" }) => {
   );
 };
 
-export const useToast = () => useContext(ToastContext);
+export const useToast = () =>
+  useContext(ToastContext) || { addToast: noop };
 export { ToastManager };
