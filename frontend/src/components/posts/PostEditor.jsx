@@ -1,17 +1,33 @@
 "use client";
 
-// components/Post/PostEditor.jsx
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useRef, useState } from "react";
 import axiosInstance from "../../lib/axiosIntance";
+import { requestPostDraft } from "../../services/ai.service";
 import { useToast } from "../UI/ToastManager";
-import { Image, Loader2, X, Send, Video } from "lucide-react";
+import {
+  Image,
+  Loader2,
+  Sparkles,
+  Send,
+  Video,
+  Wand2,
+  X,
+} from "lucide-react";
+
+const AI_TONES = ["professional", "friendly", "confident", "casual"];
+const AI_LENGTHS = ["short", "medium", "long"];
 
 export default function PostEditor({ user }) {
   const [content, setContent] = useState("");
   const [mediaItems, setMediaItems] = useState([]);
   const [isEmpty, setIsEmpty] = useState(true);
   const [isFocused, setIsFocused] = useState(false);
+  const [showAiPanel, setShowAiPanel] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiTone, setAiTone] = useState("professional");
+  const [aiLength, setAiLength] = useState("medium");
+  const [aiIncludeHashtags, setAiIncludeHashtags] = useState(true);
   const contentEditableRef = useRef(null);
   const mediaRef = useRef([]);
   const MAX_MEDIA = 10;
@@ -27,22 +43,15 @@ export default function PostEditor({ user }) {
     return src;
   };
 
-  const { mutate: createPostMutation, isPending } = useMutation({
-    mutationFn: async (postData) => {
-      const res = await axiosInstance.post("/posts/create", postData);
-      return res.data;
-    },
-    onSuccess: () => {
-      queryClient.invalidateQueries({ queryKey: ["for-you"] });
-      queryClient.invalidateQueries({ queryKey: ["following"] });
-      addToast("✨ Post created successfully", { type: "success", duration: 3000 });
-      resetForm();
-    },
-    onError: (error) => {
-      addToast("❌ Failed to create post", { type: "error", duration: 3000 });
-      console.error("Mutation error:", error.message);
-    },
-  });
+  const placeCaretAtEnd = (element) => {
+    if (!element || typeof window === "undefined") return;
+    const range = document.createRange();
+    const selection = window.getSelection();
+    range.selectNodeContents(element);
+    range.collapse(false);
+    selection?.removeAllRanges();
+    selection?.addRange(range);
+  };
 
   const highlightContent = (text) => {
     if (!text) return "";
@@ -62,18 +71,70 @@ export default function PostEditor({ user }) {
     );
   };
 
+  const syncEditorContent = (nextContent) => {
+    const normalized = typeof nextContent === "string" ? nextContent : "";
+    setContent(normalized);
+    setIsEmpty(!normalized.trim());
+
+    if (contentEditableRef.current) {
+      contentEditableRef.current.innerHTML = highlightContent(normalized);
+      placeCaretAtEnd(contentEditableRef.current);
+    }
+  };
+
+  const { mutate: createPostMutation, isPending } = useMutation({
+    mutationFn: async (postData) => {
+      const res = await axiosInstance.post("/posts/create", postData);
+      return res.data;
+    },
+    onSuccess: () => {
+      queryClient.invalidateQueries({ queryKey: ["for-you"] });
+      queryClient.invalidateQueries({ queryKey: ["following"] });
+      addToast("Post created successfully", { type: "success", duration: 3000 });
+      resetForm();
+    },
+    onError: (error) => {
+      addToast("Failed to create post", { type: "error", duration: 3000 });
+      console.error("Mutation error:", error.message);
+    },
+  });
+
+  const { mutate: generateDraftMutation, isPending: isGeneratingDraft } = useMutation({
+    mutationFn: requestPostDraft,
+    onSuccess: (data) => {
+      const draft = data?.draft || "";
+      if (!draft.trim()) {
+        addToast("The AI returned an empty draft", {
+          type: "error",
+          duration: 3000,
+        });
+        return;
+      }
+
+      syncEditorContent(draft);
+      setShowAiPanel(false);
+      setAiPrompt("");
+      setIsFocused(true);
+      addToast("AI draft added to your post editor", {
+        type: "success",
+        duration: 3000,
+      });
+    },
+    onError: (error) => {
+      addToast(
+        error?.response?.data?.message || "Failed to generate an AI post draft",
+        { type: "error", duration: 3500 }
+      );
+    },
+  });
+
   const handleInput = (e) => {
     const text = e.currentTarget.innerText;
     setContent(text);
     setIsEmpty(!text.trim());
 
-    const range = document.createRange();
-    const sel = window.getSelection();
     e.currentTarget.innerHTML = highlightContent(text);
-    range.selectNodeContents(e.currentTarget);
-    range.collapse(false);
-    sel.removeAllRanges();
-    sel.addRange(range);
+    placeCaretAtEnd(e.currentTarget);
   };
 
   const handlePostCreation = async () => {
@@ -85,6 +146,27 @@ export default function PostEditor({ user }) {
     } catch (error) {
       console.error("Error in handlePostCreation:", error.message);
     }
+  };
+
+  const handleGenerateDraft = () => {
+    const prompt = aiPrompt.trim();
+    const existingDraft = content.trim();
+
+    if (!prompt && !existingDraft) {
+      addToast("Add a prompt or start writing before using AI", {
+        type: "warning",
+        duration: 3000,
+      });
+      return;
+    }
+
+    generateDraftMutation({
+      prompt: prompt || "Turn this idea into a polished social media post.",
+      tone: aiTone,
+      length: aiLength,
+      includeHashtags: aiIncludeHashtags,
+      existingDraft: existingDraft || undefined,
+    });
   };
 
   const handleMediaChange = (e) => {
@@ -129,6 +211,8 @@ export default function PostEditor({ user }) {
     clearAllMedia();
     setIsEmpty(true);
     setIsFocused(false);
+    setAiPrompt("");
+    setShowAiPanel(false);
     if (contentEditableRef.current) {
       contentEditableRef.current.innerHTML = "";
     }
@@ -148,8 +232,20 @@ export default function PostEditor({ user }) {
 
   return (
     <div className="bg-white rounded-lg shadow border border-gray-200 mb-4 overflow-hidden">
-      <div className="p-3 border-b border-gray-200">
+      <div className="p-3 border-b border-gray-200 flex items-center justify-between">
         <h3 className="font-semibold text-gray-900">Create a post</h3>
+        <button
+          type="button"
+          onClick={() => setShowAiPanel((prev) => !prev)}
+          className={`inline-flex items-center gap-2 rounded-full border px-3 py-1 text-xs font-semibold transition ${
+            showAiPanel
+              ? "border-blue-200 bg-blue-50 text-blue-700"
+              : "border-gray-200 bg-white text-gray-600 hover:border-blue-200 hover:text-blue-700"
+          }`}
+        >
+          <Sparkles size={14} />
+          AI Draft
+        </button>
       </div>
 
       <div className="p-3">
@@ -168,7 +264,7 @@ export default function PostEditor({ user }) {
           <div className="flex-1 relative">
             {isEmpty && !isFocused && (
               <div className="absolute left-0 top-0 text-gray-400 pointer-events-none select-none text-sm">
-                What's on your mind, {user.name?.split(" ")[0]}?
+                What&apos;s on your mind, {user.name?.split(" ")[0]}?
               </div>
             )}
             <div
@@ -184,6 +280,111 @@ export default function PostEditor({ user }) {
             />
           </div>
         </div>
+
+        {showAiPanel && (
+          <div className="mt-3 rounded-2xl border border-blue-100 bg-gradient-to-br from-blue-50 via-white to-cyan-50 p-4 shadow-sm">
+            <div className="flex items-start justify-between gap-3">
+              <div>
+                <p className="text-sm font-semibold text-gray-900 flex items-center gap-2">
+                  <Wand2 size={16} className="text-blue-600" />
+                  Generate a polished draft
+                </p>
+                <p className="mt-1 text-xs text-gray-500">
+                  Use a prompt, your current text, or both. The result is inserted into the editor for review before posting.
+                </p>
+              </div>
+              <button
+                type="button"
+                onClick={() => setShowAiPanel(false)}
+                className="rounded-full p-1 text-gray-400 hover:bg-white hover:text-gray-600"
+                aria-label="Close AI draft panel"
+              >
+                <X size={14} />
+              </button>
+            </div>
+
+            <textarea
+              value={aiPrompt}
+              onChange={(e) => setAiPrompt(e.target.value)}
+              placeholder="Example: Announce our new creator tools in a confident, product-launch style"
+              rows={3}
+              className="mt-3 w-full rounded-xl border border-white bg-white/90 px-3 py-2 text-sm text-gray-900 outline-none ring-0 placeholder:text-gray-400"
+            />
+
+            <div className="mt-3 grid gap-3 sm:grid-cols-2">
+              <label className="text-xs font-medium text-gray-600">
+                Tone
+                <select
+                  value={aiTone}
+                  onChange={(e) => setAiTone(e.target.value)}
+                  className="mt-1 w-full rounded-xl border border-white bg-white px-3 py-2 text-sm text-gray-900 outline-none"
+                >
+                  {AI_TONES.map((tone) => (
+                    <option key={tone} value={tone}>
+                      {tone[0].toUpperCase() + tone.slice(1)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+
+              <label className="text-xs font-medium text-gray-600">
+                Length
+                <select
+                  value={aiLength}
+                  onChange={(e) => setAiLength(e.target.value)}
+                  className="mt-1 w-full rounded-xl border border-white bg-white px-3 py-2 text-sm text-gray-900 outline-none"
+                >
+                  {AI_LENGTHS.map((length) => (
+                    <option key={length} value={length}>
+                      {length[0].toUpperCase() + length.slice(1)}
+                    </option>
+                  ))}
+                </select>
+              </label>
+            </div>
+
+            <label className="mt-3 flex items-center gap-2 text-xs text-gray-600">
+              <input
+                type="checkbox"
+                checked={aiIncludeHashtags}
+                onChange={(e) => setAiIncludeHashtags(e.target.checked)}
+                className="rounded border-gray-300 text-blue-600 focus:ring-blue-500"
+              />
+              Add relevant hashtags at the end
+            </label>
+
+            <div className="mt-3 flex flex-wrap items-center gap-2">
+              <button
+                type="button"
+                onClick={handleGenerateDraft}
+                disabled={isGeneratingDraft}
+                className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
+                  isGeneratingDraft
+                    ? "bg-gray-200 text-gray-500"
+                    : "bg-blue-600 text-white hover:bg-blue-700"
+                }`}
+              >
+                {isGeneratingDraft ? (
+                  <>
+                    <Loader2 size={16} className="animate-spin" />
+                    Generating...
+                  </>
+                ) : (
+                  <>
+                    <Sparkles size={16} />
+                    Generate Draft
+                  </>
+                )}
+              </button>
+
+              {content.trim() && (
+                <span className="text-xs text-gray-500">
+                  Your current editor text will also be used as context.
+                </span>
+              )}
+            </div>
+          </div>
+        )}
 
         {mediaItems.length > 0 && (
           <div className="mt-3">
@@ -237,21 +438,32 @@ export default function PostEditor({ user }) {
           </div>
         )}
 
-        <div className="flex justify-between items-center mt-3 pt-3 border-t border-gray-100">
-          <label className="cursor-pointer">
-            <div className="flex items-center gap-2 px-3 py-1 text-blue-600 hover:bg-blue-50 rounded-lg text-sm">
-              <Image size={18} />
-              <Video size={18} />
-              Media
-            </div>
-            <input
-              type="file"
-              accept="image/*,video/*"
-              multiple
-              className="hidden"
-              onChange={handleMediaChange}
-            />
-          </label>
+        <div className="flex flex-wrap justify-between items-center gap-2 mt-3 pt-3 border-t border-gray-100">
+          <div className="flex items-center gap-2">
+            <label className="cursor-pointer">
+              <div className="flex items-center gap-2 px-3 py-1 text-blue-600 hover:bg-blue-50 rounded-lg text-sm">
+                <Image size={18} />
+                <Video size={18} />
+                Media
+              </div>
+              <input
+                type="file"
+                accept="image/*,video/*"
+                multiple
+                className="hidden"
+                onChange={handleMediaChange}
+              />
+            </label>
+
+            <button
+              type="button"
+              onClick={() => setShowAiPanel((prev) => !prev)}
+              className="flex items-center gap-2 px-3 py-1 rounded-lg text-sm text-gray-600 hover:bg-gray-100"
+            >
+              <Sparkles size={16} />
+              AI
+            </button>
+          </div>
 
           <button
             disabled={isPostDisabled || isPending}

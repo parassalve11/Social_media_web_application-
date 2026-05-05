@@ -1,3 +1,4 @@
+import mongoose from "mongoose";
 import { uploadToClouduinary } from "../lib/cloudinary.js";
 import Conversation from "../models/conversation.model.js";
 import Message from "../models/message.model.js";
@@ -5,11 +6,26 @@ import response from "../lib/responeHandler.js";
 
 export const sendMessage = async (req, res) => {
   try {
-    const { senderId, receiverId, content, messageStatus } = req.body;
-    const files = req.files; // 👈 MULTIPLE FILES
-    const participants = [senderId, receiverId].sort();
+    const senderId = req.user?._id?.toString();
+    const { receiverId, content, messageStatus } = req.body;
+    const files = req.files;
+    const participants = [senderId, String(receiverId || "")].sort();
 
-    let conversation = await Conversation.findOne({ participants });
+    if (!senderId) {
+      return response(res, 401, "Unauthorized");
+    }
+
+    if (!receiverId || !mongoose.isValidObjectId(receiverId)) {
+      return response(res, 400, "A valid receiver is required");
+    }
+
+    if (senderId === String(receiverId)) {
+      return response(res, 400, "You cannot send a message to yourself");
+    }
+
+    let conversation = await Conversation.findOne({
+      participants: { $all: participants },
+    });
     if (!conversation) {
       conversation = await Conversation.create({ participants });
     }
@@ -17,7 +33,6 @@ export const sendMessage = async (req, res) => {
     let imageOrVideoUrl = [];
     let contentType = null;
 
-    /* ---------- MEDIA ---------- */
     if (files && files.length > 0) {
       for (const file of files) {
         const upload = await uploadToClouduinary(file);
@@ -35,9 +50,7 @@ export const sendMessage = async (req, res) => {
           return response(res, 400, "Unsupported file type");
         }
       }
-    }
-    /* ---------- TEXT ---------- */
-    else if (content?.trim()) {
+    } else if (content?.trim()) {
       contentType = "text";
     } else {
       return response(res, 400, "Message content is required");
@@ -45,7 +58,7 @@ export const sendMessage = async (req, res) => {
 
     const message = await Message.create({
       conversation: conversation._id,
-      sender: senderId,
+      sender: req.user._id,
       receiver: receiverId,
       content,
       imageOrVideoUrl,
@@ -61,16 +74,17 @@ export const sendMessage = async (req, res) => {
       .populate("sender", "username profilePicture")
       .populate("receiver", "username profilePicture");
 
-    /* ---------- SOCKET ---------- */
     if (req.io && req.socketUserMap) {
-      const senderSocketId = req.socketUserMap.get(senderId);
-      const receiverSocketId = req.socketUserMap.get(receiverId);
+      const senderSocketId = req.socketUserMap.get(String(senderId));
+      const receiverSocketId = req.socketUserMap.get(String(receiverId));
 
-      if (senderSocketId)
+      if (senderSocketId) {
         req.io.to(senderSocketId).emit("send_message", populatedMessage);
+      }
 
-      if (receiverSocketId)
+      if (receiverSocketId) {
         req.io.to(receiverSocketId).emit("receive_message", populatedMessage);
+      }
     }
 
     return response(res, 201, "Message sent", populatedMessage);
@@ -79,7 +93,6 @@ export const sendMessage = async (req, res) => {
     return response(res, 500, "Internal server error");
   }
 };
-
 
 export const getConversation = async (req, res) => {
   try {
@@ -117,8 +130,7 @@ export const getMessages = async (req, res) => {
     }
 
     const isParticipant = conversation.participants.some(
-      (participantId) =>
-        participantId.toString() === userId.toString()
+      (participantId) => participantId.toString() === userId.toString()
     );
     if (!isParticipant) {
       return response(
@@ -174,12 +186,9 @@ export const markAsRead = async (req, res) => {
       { $set: { messageStatus: "read" } }
     );
 
-    //emit socket
     if (req.io && req.socketUserMap) {
       for (const message of messages) {
-        const senderSocketId = req.socketUserMap.get(
-          message.sender._id.toString()
-        );
+        const senderSocketId = req.socketUserMap.get(message.sender.toString());
         if (senderSocketId) {
           const updatedMessage = {
             _id: message._id,
@@ -217,12 +226,8 @@ export const deleteMessage = async (req, res) => {
 
     await message.deleteOne();
 
-    //emit sockets
-
     if (req.io && req.socketUserMap) {
-      const receiverSocketId = req.socketUserMap.get(
-        message.receiver._id.toString()
-      );
+      const receiverSocketId = req.socketUserMap.get(message.receiver.toString());
       if (receiverSocketId) {
         req.io.to(receiverSocketId).emit("message_deleted", messageId);
       }

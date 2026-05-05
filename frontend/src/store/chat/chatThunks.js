@@ -39,9 +39,11 @@ export const fetchMessages = createAsyncThunk(
 export const sendMessage = createAsyncThunk(
   "chat/sendMessage",
   async (formData, { dispatch, getState }) => {
-    const { currentConversation } = getState().chat;
+    const state = getState();
+    const { currentConversation, currentUser } = state.chat;
 
-    const senderId = formData.get("senderId");
+    const senderId =
+      currentUser?._id || state.user?.user?._id || formData.get("senderId");
     const receiverId = formData.get("receiverId");
     const content = formData.get("content");
     const messageStatus = formData.get("messageStatus") || "send";

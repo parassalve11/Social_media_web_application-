@@ -14,7 +14,6 @@ import {
 } from "lucide-react";
 import axiosInstance from "../../lib/axiosIntance";
 import { useToast } from "../UI/ToastManager";
-import { jwtDecode } from "jwt-decode";
 import { GoogleLogin } from "@react-oauth/google";
 import useFormValidation from "../../hooks/useFormValidation";
 import { Link, useNavigate } from "react-router-dom";
@@ -88,11 +87,16 @@ const SignInForm = () => {
       const res = await axiosInstance.post("/auth/google-auth", data);
       return res.data;
     },
-    onSuccess: () => {
+    onSuccess: (data) => {
       addToast("Signed In with Google successfully!", {
         type: "success",
         duration: 3000,
       });
+      const authUser = data?.user;
+      if (authUser) {
+        setUser(authUser);
+        queryClient.setQueryData(["authUser"], authUser);
+      }
       queryClient.invalidateQueries({ queryKey: ["authUser"] });
       setError("");
       navigate("/");
@@ -109,10 +113,11 @@ const SignInForm = () => {
 
   const handleGoogleSuccess = async (credentialResponse) => {
     try {
-      const decoded = jwtDecode(credentialResponse.credential);
-      const { name, email, sub: googleId } = decoded;
+      if (!credentialResponse?.credential) {
+        throw new Error("Missing Google credential");
+      }
 
-      googleAuthMutation({ name, email, googleId });
+      googleAuthMutation({ credential: credentialResponse.credential });
     } catch (error) {
       addToast("Unable to sign in with Google.", {
         type: "error",

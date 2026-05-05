@@ -1,5 +1,6 @@
 import User from "../models/user.model.js";
 import jwt from "jsonwebtoken";
+import { OAuth2Client } from "google-auth-library";
 
 import { AUTH_CONFIG } from "../lib/auth.config.js";
 import { audit } from "../lib/audit.js";
@@ -102,6 +103,42 @@ const getAuthMethodLabel = (authSource) =>
 
 const escapeRegExp = (value = "") =>
   value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
+
+let googleClient = null;
+
+const getGoogleOAuthClient = () => {
+  const clientId =
+    process.env.GOOGLE_CLIENT_ID || process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
+
+  if (!clientId) {
+    return null;
+  }
+
+  if (!googleClient) {
+    googleClient = new OAuth2Client(clientId);
+  }
+
+  return googleClient;
+};
+
+const verifyGoogleCredential = async (credential) => {
+  const client = getGoogleOAuthClient();
+  const clientId =
+    process.env.GOOGLE_CLIENT_ID || process.env.NEXT_PUBLIC_GOOGLE_CLIENT_ID;
+
+  if (!client || !clientId) {
+    const error = new Error("Google auth is not configured");
+    error.statusCode = 503;
+    throw error;
+  }
+
+  const ticket = await client.verifyIdToken({
+    idToken: credential,
+    audience: clientId,
+  });
+
+  return ticket.getPayload();
+};
 
 export const signUp = async (req, res) => {
   try {
@@ -389,7 +426,24 @@ export const signIn = async (req, res) => {
 
 export const googleAuth = async (req, res) => {
   try {
-    const { name, email, googleId } = req.body;
+    const { credential } = req.body;
+    let name = req.body?.name;
+    let email = req.body?.email;
+    let googleId = req.body?.googleId;
+
+    if (credential) {
+      const payload = await verifyGoogleCredential(credential);
+      name = payload?.name || name;
+      email = payload?.email || email;
+      googleId = payload?.sub || googleId;
+
+      if (!payload?.email_verified) {
+        return res.status(401).json({
+          message: "Google account email is not verified",
+        });
+      }
+    }
+
     const normalizedEmail = normalizeEmail(email);
 
     if (!name || !normalizedEmail || !googleId) {
@@ -436,10 +490,19 @@ export const googleAuth = async (req, res) => {
     res.status(200).json({
       message: "Google authentication successful",
       token: accessToken,
+      user: {
+        _id: user._id,
+        name: user.name,
+        email: user.email,
+        username: user.username,
+        avatar: user.avatar,
+      },
     });
   } catch (error) {
     logError("auth.google.error", { error: error.message });
-    res.status(500).json({ message: "Server Error" });
+    res
+      .status(error.statusCode || 500)
+      .json({ message: error.statusCode ? error.message : "Server Error" });
   }
 };
 

@@ -5,20 +5,21 @@ import cors from "cors";
 import path from "path";
 
 import authRouters from "./routers/auth.route.js";
+import aiRoutes from "./routers/ai.route.js";
 import postRoutes from "./routers/post.route.js";
 import notificationRoutes from "./routers/notification.route.js";
 import followRoutes from "./routers/follow.route.js";
 import userRoutes from "./routers/user.route.js";
 import MessageRoutes from "./routers/message.route.js";
 import StatusRoutes from "./routers/status.route.js";
-import ReelRoutes from "./routers/reel.route.js";          // ← NEW
+import ReelRoutes from "./routers/reel.route.js";
 import { csrfProtect } from "./middlewares/csrf.middleware.js";
 
 dotenv.config();
 
 const __dirname = path.resolve();
 
-const createApp = ({ emailService, getIo } = {}) => {
+const createApp = ({ emailService, getIo, aiService } = {}) => {
   const app = express();
 
   app.use(cookieParser());
@@ -39,15 +40,17 @@ const createApp = ({ emailService, getIo } = {}) => {
   app.use(csrfProtect);
 
   app.locals.emailService = emailService;
+  app.locals.aiService = aiService;
 
-  app.use("/api/v1/auth",          authRouters);
-  app.use("/api/v1/posts",         postRoutes);
+  app.use("/api/v1/auth", authRouters);
+  app.use("/api/v1/ai", aiRoutes);
+  app.use("/api/v1/posts", postRoutes);
   app.use("/api/v1/notifications", notificationRoutes);
-  app.use("/api/v1/follows",       followRoutes);
-  app.use("/api/v1/users",         userRoutes);
-  app.use("/api/v1/message",       MessageRoutes);
-  app.use("/api/v1/status",        StatusRoutes);
-  app.use("/api/v1/reels",         ReelRoutes);             // ← NEW
+  app.use("/api/v1/follows", followRoutes);
+  app.use("/api/v1/users", userRoutes);
+  app.use("/api/v1/message", MessageRoutes);
+  app.use("/api/v1/status", StatusRoutes);
+  app.use("/api/v1/reels", ReelRoutes);
 
   if (process.env.NODE_ENV === "production") {
     app.use(express.static(path.join(__dirname, "/frontend/dist")));

@@ -3,7 +3,19 @@
 // frontend/src/components/message/chat/ChatWindow.jsx
 // ── Only the header section changes — CallButton added beside username
 import React, { useCallback, useEffect, useRef, useState } from "react";
-import { ArrowLeft, Send, SmilePlus, Paperclip, X, MessageCircle, Image as ImageIcon, Film, Loader2 } from "lucide-react";
+import {
+  ArrowLeft,
+  Send,
+  SmilePlus,
+  Paperclip,
+  Sparkles,
+  Wand2,
+  X,
+  MessageCircle,
+  Image as ImageIcon,
+  Film,
+  Loader2,
+} from "lucide-react";
 import { isToday, isYesterday, format } from "date-fns";
 import Picker from "@emoji-mart/react";
 import data from "@emoji-mart/data";
@@ -13,7 +25,12 @@ import { useUser } from "../../../store/user/useUser";
 import { motion as Motion, AnimatePresence } from "framer-motion";
 import { useQueryClient } from "@tanstack/react-query";
 import CallButton from "../../call/CallButton";
-import { useCall, CALL_STATUS } from "../../../store/call/useCall";
+import { useCall } from "../../../store/call/useCall";
+import { useToast } from "../../UI/ToastManager";
+import { requestMessageDraft } from "../../../services/ai.service";
+
+const AI_MESSAGE_TONES = ["friendly", "professional", "warm", "confident"];
+const AI_MESSAGE_LENGTHS = ["short", "medium", "long"];
 
 /* ─── date divider ─── */
 const DateDivider = ({ date }) => {
@@ -85,6 +102,11 @@ export default function ChatWindow({ selectedContact, setSelectedContact }) {
   const [progress, setProgress]     = useState({});
   const [showEmoji, setShowEmoji]   = useState(false);
   const [isDragging, setIsDragging] = useState(false);
+  const [showAiPanel, setShowAiPanel] = useState(false);
+  const [aiPrompt, setAiPrompt] = useState("");
+  const [aiTone, setAiTone] = useState("friendly");
+  const [aiLength, setAiLength] = useState("short");
+  const [aiLoading, setAiLoading] = useState(false);
 
   const endRef       = useRef(null);
   const textareaRef  = useRef(null);
@@ -94,6 +116,7 @@ export default function ChatWindow({ selectedContact, setSelectedContact }) {
   const progressTimer = useRef(null);
 
   const { user }      = useUser();
+  const { addToast }  = useToast();
   const queryClient   = useQueryClient();
   const { messages, fetchMessages, sendMessage, isTypingUser, isUserOnline, startTyping, stopTyping, clearMessages } = useChat();
 
@@ -145,6 +168,16 @@ export default function ChatWindow({ selectedContact, setSelectedContact }) {
     setPreviews(p => [...p, ...urls]);
   };
 
+  const getMessageContextText = useCallback((msg) => {
+    if (msg?.content?.trim()) return msg.content.trim();
+    if (msg?.contentType === "image") return "[shared an image]";
+    if (msg?.contentType === "video") return "[shared a video]";
+    if (Array.isArray(msg?.imageOrVideoUrl) && msg.imageOrVideoUrl.length) {
+      return "[shared media]";
+    }
+    return "";
+  }, []);
+
   const removeFile = (i) => {
     URL.revokeObjectURL(previews[i]);
     setFiles(p => p.filter((_, idx) => idx !== i));
@@ -160,6 +193,78 @@ export default function ChatWindow({ selectedContact, setSelectedContact }) {
     typingTimer.current = setTimeout(() => stopTyping(selectedContact._id), 2000);
   };
 
+  const handleGenerateAiDraft = useCallback(async () => {
+    const prompt = aiPrompt.trim();
+    const existingDraft = message.trim();
+    const hasContext = messages.length > 0;
+
+    if (!prompt && !existingDraft && !hasContext) {
+      addToast("Add a prompt or start the conversation before using AI", {
+        type: "warning",
+        duration: 3000,
+      });
+      return;
+    }
+
+    setAiLoading(true);
+
+    try {
+      const recentMessages = messages.slice(-8).map((msg) => {
+        const senderId = String(msg?.sender?._id ?? msg?.sender);
+        return {
+          role: senderId === String(user?._id) ? "me" : selectedContact?.username || "them",
+          content: getMessageContextText(msg),
+        };
+      }).filter((item) => item.content);
+
+      const result = await requestMessageDraft({
+        prompt: prompt || "Write a polished reply that moves this conversation forward.",
+        tone: aiTone,
+        length: aiLength,
+        recipientName: selectedContact?.username,
+        relationshipContext: selectedContact?.bio || "",
+        existingDraft: existingDraft || undefined,
+        recentMessages,
+      });
+
+      const draft = result?.draft || "";
+      if (!draft.trim()) {
+        addToast("The AI returned an empty message draft", {
+          type: "error",
+          duration: 3000,
+        });
+        return;
+      }
+
+      setMessage(draft);
+      setShowAiPanel(false);
+      setAiPrompt("");
+      requestAnimationFrame(() => textareaRef.current?.focus());
+      addToast("AI draft added to your message box", {
+        type: "success",
+        duration: 3000,
+      });
+    } catch (error) {
+      addToast(
+        error?.response?.data?.message || "Failed to generate an AI message draft",
+        { type: "error", duration: 3500 }
+      );
+    } finally {
+      setAiLoading(false);
+    }
+  }, [
+    aiLength,
+    aiPrompt,
+    aiTone,
+    addToast,
+    getMessageContextText,
+    message,
+    messages,
+    selectedContact?.bio,
+    selectedContact?.username,
+    user?._id,
+  ]);
+
   const handleSend = useCallback(async () => {
     const hasText  = message.trim().length > 0;
     const hasFiles = files.length > 0;
@@ -167,7 +272,6 @@ export default function ChatWindow({ selectedContact, setSelectedContact }) {
     if (sending) return;
 
     const formData = new FormData();
-    formData.append("senderId", user._id);
     formData.append("receiverId", selectedContact._id);
     if (hasText) formData.append("content", message.trim());
     files.forEach(f => formData.append("media", f));
@@ -333,6 +437,110 @@ export default function ChatWindow({ selectedContact, setSelectedContact }) {
       {/* ══ INPUT AREA ══ */}
       <div className="flex-shrink-0 bg-white border-t border-gray-200 z-10">
         <AnimatePresence>
+          {showAiPanel && (
+            <Motion.div
+              initial={{ height: 0, opacity: 0 }}
+              animate={{ height: "auto", opacity: 1 }}
+              exit={{ height: 0, opacity: 0 }}
+              className="overflow-hidden border-b border-blue-100 bg-gradient-to-r from-blue-50 via-white to-cyan-50"
+            >
+              <div className="px-4 py-3">
+                <div className="flex items-start justify-between gap-3">
+                  <div>
+                    <p className="text-sm font-semibold text-gray-900 flex items-center gap-2">
+                      <Wand2 className="w-4 h-4 text-blue-600" />
+                      Generate an AI reply draft
+                    </p>
+                    <p className="mt-1 text-xs text-gray-500">
+                      Recent chat context and your unsent draft can both be used before you send.
+                    </p>
+                  </div>
+                  <button
+                    type="button"
+                    onClick={() => setShowAiPanel(false)}
+                    className="rounded-full p-1 text-gray-400 hover:bg-white hover:text-gray-600"
+                    aria-label="Close AI reply panel"
+                  >
+                    <X className="w-4 h-4" />
+                  </button>
+                </div>
+
+                <textarea
+                  value={aiPrompt}
+                  onChange={(e) => setAiPrompt(e.target.value)}
+                  rows={3}
+                  placeholder="Example: Reply politely, confirm tomorrow at 4 PM, and keep it concise"
+                  className="mt-3 w-full rounded-xl border border-white bg-white px-3 py-2 text-sm text-gray-900 outline-none placeholder:text-gray-400"
+                />
+
+                <div className="mt-3 grid gap-3 sm:grid-cols-2">
+                  <label className="text-xs font-medium text-gray-600">
+                    Tone
+                    <select
+                      value={aiTone}
+                      onChange={(e) => setAiTone(e.target.value)}
+                      className="mt-1 w-full rounded-xl border border-white bg-white px-3 py-2 text-sm text-gray-900 outline-none"
+                    >
+                      {AI_MESSAGE_TONES.map((tone) => (
+                        <option key={tone} value={tone}>
+                          {tone[0].toUpperCase() + tone.slice(1)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+
+                  <label className="text-xs font-medium text-gray-600">
+                    Length
+                    <select
+                      value={aiLength}
+                      onChange={(e) => setAiLength(e.target.value)}
+                      className="mt-1 w-full rounded-xl border border-white bg-white px-3 py-2 text-sm text-gray-900 outline-none"
+                    >
+                      {AI_MESSAGE_LENGTHS.map((length) => (
+                        <option key={length} value={length}>
+                          {length[0].toUpperCase() + length.slice(1)}
+                        </option>
+                      ))}
+                    </select>
+                  </label>
+                </div>
+
+                <div className="mt-3 flex flex-wrap items-center gap-2">
+                  <button
+                    type="button"
+                    onClick={handleGenerateAiDraft}
+                    disabled={aiLoading}
+                    className={`inline-flex items-center gap-2 rounded-xl px-4 py-2 text-sm font-semibold transition ${
+                      aiLoading
+                        ? "bg-gray-200 text-gray-500"
+                        : "bg-blue-600 text-white hover:bg-blue-700"
+                    }`}
+                  >
+                    {aiLoading ? (
+                      <>
+                        <Loader2 className="w-4 h-4 animate-spin" />
+                        Generating...
+                      </>
+                    ) : (
+                      <>
+                        <Sparkles className="w-4 h-4" />
+                        Generate Draft
+                      </>
+                    )}
+                  </button>
+
+                  {(message.trim() || messages.length > 0) && (
+                    <span className="text-xs text-gray-500">
+                      The current draft and recent chat can be used as context.
+                    </span>
+                  )}
+                </div>
+              </div>
+            </Motion.div>
+          )}
+        </AnimatePresence>
+
+        <AnimatePresence>
           {files.length > 0 && (
             <Motion.div initial={{ height: 0, opacity: 0 }} animate={{ height: "auto", opacity: 1 }}
               exit={{ height: 0, opacity: 0 }} className="overflow-hidden border-b border-gray-100">
@@ -394,6 +602,19 @@ export default function ChatWindow({ selectedContact, setSelectedContact }) {
           </button>
           <input ref={fileRef} type="file" hidden multiple accept="image/*,video/*"
             onChange={e => appendFiles(Array.from(e.target.files))} />
+
+          <button
+            type="button"
+            onClick={() => setShowAiPanel((prev) => !prev)}
+            className={`flex-shrink-0 p-2.5 rounded-xl transition-colors ${
+              showAiPanel
+                ? "text-blue-600 bg-blue-50"
+                : "text-gray-400 hover:text-gray-600 hover:bg-gray-100"
+            }`}
+            title="Generate AI draft"
+          >
+            <Sparkles className="w-5 h-5" />
+          </button>
 
           <div className="flex-1 bg-gray-100 rounded-2xl px-4 py-2.5 flex items-end min-h-[44px]">
             <textarea ref={textareaRef} value={message} onChange={e => handleTyping(e.target.value)}
