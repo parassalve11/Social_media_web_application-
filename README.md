@@ -50,6 +50,19 @@ npm install
 npm run dev
 ```
 
+## Deployment
+Deploy the frontend and backend separately.
+
+- Frontend: deploy the `frontend/` directory as its own Vercel project.
+- Backend: deploy `backend/server.js` to a Node host such as Render or Railway. This backend uses Express, Socket.IO, and background email workers, so it should not be deployed as a single Vercel frontend project.
+
+If Vercel shows `404: NOT_FOUND` for this repo, the usual cause is importing the repository root instead of setting the Vercel project's Root Directory to `frontend`.
+
+Frontend environment variables:
+
+- `NEXT_PUBLIC_BACKEND_URL=`
+- `NEXT_PUBLIC_API_BASE_URL=`
+
 ## Tests
 ```bash
 npm run test:unit

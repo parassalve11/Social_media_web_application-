@@ -8,6 +8,7 @@ const __dirname = path.dirname(__filename);
 const nextConfig = {
   reactStrictMode: true,
   pageExtensions: ["ts", "tsx"],
+  outputFileTracingRoot: path.join(__dirname, ".."),
   images: {
     domains: ["res.cloudinary.com", "cdn.pixabay.com", "via.placeholder.com"],
   },
